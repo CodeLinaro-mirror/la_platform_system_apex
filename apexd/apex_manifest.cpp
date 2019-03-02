@@ -14,62 +14,84 @@
  * limitations under the License.
  */
 
+#include "apex_manifest.h"
+#include "string_log.h"
 #include <android-base/logging.h>
+
+#include <google/protobuf/util/json_util.h>
+#include <google/protobuf/util/type_resolver_util.h>
 #include <memory>
 #include <string>
 
-#include <json/reader.h>
-#include <json/value.h>
-
-#include "apex_manifest.h"
-#include "string_log.h"
+using google::protobuf::DescriptorPool;
+using google::protobuf::scoped_ptr;
+using google::protobuf::util::NewTypeResolverForDescriptorPool;
+using google::protobuf::util::TypeResolver;
 
 namespace android {
 namespace apex {
+namespace {
+const char kTypeUrlPrefix[] = "type.googleapis.com";
 
-StatusOr<std::unique_ptr<ApexManifest>> ApexManifest::Open(
-    const std::string& apex_manifest) {
-  std::unique_ptr<ApexManifest> ret(new ApexManifest(apex_manifest));
-  std::string error_msg;
-  if (ret->OpenInternal(&error_msg) < 0) {
-    return StatusOr<std::unique_ptr<ApexManifest>>::MakeError(error_msg);
-  }
-  return StatusOr<std::unique_ptr<ApexManifest>>(std::move(ret));
+std::string GetTypeUrl(const ApexManifest& apex_manifest) {
+  const google::protobuf::Descriptor* message = apex_manifest.GetDescriptor();
+  return std::string(kTypeUrlPrefix) + "/" + message->full_name();
 }
 
-int ApexManifest::OpenInternal(std::string* error_msg) {
-  Json::Value root;
-  Json::Reader reader;
-
-  if (!reader.parse(manifest_, root)) {
-    *error_msg = StringLog() << "Failed to parse APEX Manifest JSON config: "
-                             << reader.getFormattedErrorMessages();
-    return -1;
+// TODO: JsonStringToMessage is a newly added function in protobuf
+// and is not yet available in the android tree. Replace this function with
+// https://developers.google.com/protocol-buffers/docs/reference/cpp/
+// google.protobuf.util.json_util#JsonStringToMessage.details
+// as and when the android tree gets updated
+StatusOr<ApexManifest> JsonToApexManifestMessage(const std::string& content,
+                                                 ApexManifest& apex_manifest) {
+  scoped_ptr<TypeResolver> resolver(NewTypeResolverForDescriptorPool(
+      kTypeUrlPrefix, DescriptorPool::generated_pool()));
+  std::string binary;
+  auto parse_status = JsonToBinaryString(
+      resolver.get(), GetTypeUrl(apex_manifest), content, &binary);
+  if (!parse_status.ok()) {
+    return StatusOr<ApexManifest>::MakeError(
+        StringLog() << "Failed to parse APEX Manifest JSON config: "
+                    << parse_status.error_message().as_string());
   }
 
-  if (!root.isMember("name")) {
-    *error_msg = StringLog()
-                 << "Missing required field \"name\" from APEX manifest.";
-    return -1;
+  if (!apex_manifest.ParseFromString(binary)) {
+    return StatusOr<ApexManifest>::MakeError(
+        StringLog() << "Unexpected fields in APEX Manifest JSON config");
   }
-  Json::Value name = root["name"];
-  name_ = name.asString();
+  return StatusOr<ApexManifest>(apex_manifest);
+}
 
-  if (!root.isMember("version")) {
-    *error_msg = StringLog()
-                 << "Missing required field \"version\" from APEX manifest.";
-    return -1;
-  }
-  Json::Value version = root["version"];
-  if (!version.isUInt64()) {
-    *error_msg = StringLog()
-                 << "Invalid type for field \"version\" from APEX manifest, "
-                    "expecting integer.";
-    return -1;
-  }
-  version_ = version.asUInt64();
+}  // namespace
 
-  return 0;
+StatusOr<ApexManifest> ParseManifest(const std::string& content) {
+  ApexManifest apex_manifest;
+  std::string err;
+  StatusOr<ApexManifest> parse_manifest_status =
+      JsonToApexManifestMessage(content, apex_manifest);
+  if (!parse_manifest_status.Ok()) {
+    return parse_manifest_status;
+  }
+
+  // Verifying required fields.
+  // name
+  if (apex_manifest.name().empty()) {
+    err = StringLog() << "Missing required field \"name\" from APEX manifest.";
+    return StatusOr<ApexManifest>::MakeError(err);
+  }
+
+  // version
+  if (apex_manifest.version() == 0) {
+    err =
+        StringLog() << "Missing required field \"version\" from APEX manifest.";
+    return StatusOr<ApexManifest>::MakeError(err);
+  }
+  return parse_manifest_status;
+}
+
+std::string GetPackageId(const ApexManifest& apexManifest) {
+  return apexManifest.name() + "@" + std::to_string(apexManifest.version());
 }
 
 }  // namespace apex

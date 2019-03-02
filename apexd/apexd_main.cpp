@@ -16,14 +16,54 @@
 
 #define LOG_TAG "apexd"
 
-#include "apexd.h"
+#include <strings.h>
 
 #include <android-base/logging.h>
 
+#include "apexd.h"
+#include "apexd_prepostinstall.h"
+#include "apexd_prop.h"
 #include "apexservice.h"
 
+namespace {
+
+int HandleSubcommand(char** argv) {
+  if (strcmp("--pre-install", argv[1]) == 0) {
+    LOG(INFO) << "Preinstall subcommand detected";
+    return android::apex::RunPreInstall(argv);
+  }
+
+  if (strcmp("--post-install", argv[1]) == 0) {
+    LOG(INFO) << "Postinstall subcommand detected";
+    return android::apex::RunPostInstall(argv);
+  }
+
+  LOG(ERROR) << "Unknown subcommand: " << argv[1];
+  return 1;
+}
+
+struct CombinedLogger {
+  android::base::LogdLogger logd;
+
+  CombinedLogger() {}
+
+  void operator()(android::base::LogId id, android::base::LogSeverity severity,
+                  const char* tag, const char* file, unsigned int line,
+                  const char* message) {
+    logd(id, severity, tag, file, line, message);
+    KernelLogger(id, severity, tag, file, line, message);
+  }
+};
+
+}  // namespace
+
 int main(int /*argc*/, char** argv) {
-  android::base::InitLogging(argv);
+  // Use CombinedLogger to also log to the kernel log.
+  android::base::InitLogging(argv, CombinedLogger());
+
+  if (argv[1] != nullptr) {
+    return HandleSubcommand(argv);
+  }
 
   android::apex::onStart();
 
@@ -33,6 +73,9 @@ int main(int /*argc*/, char** argv) {
   android::apex::binder::CreateAndRegisterService();
 
   android::apex::unmountAndDetachExistingImages();
+
+  android::apex::scanStagedSessionsDirAndStage();
+
   // Scan the directory under /data first, as it may contain updates of APEX
   // packages living in the directory under /system, and we want the former ones
   // to be used over the latter ones.
@@ -43,6 +86,10 @@ int main(int /*argc*/, char** argv) {
   // Notify other components (e.g. init) that all APEXs are correctly mounted
   // and are ready to be used.
   android::apex::onAllPackagesReady();
+
+  android::apex::binder::StartThreadPool();
+
+  android::apex::waitForBootStatus(android::apex::rollbackLastSession);
 
   android::apex::binder::JoinThreadPool();
 
