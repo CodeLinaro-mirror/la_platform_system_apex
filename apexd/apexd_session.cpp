@@ -143,7 +143,7 @@ std::vector<ApexSession> ApexSession::GetSessionsInState(
   auto sessions = GetSessions();
   sessions.erase(
       std::remove_if(sessions.begin(), sessions.end(),
-                     [&](ApexSession s) { return s.GetState() != state; }),
+                     [&](const ApexSession &s) { return s.GetState() != state; }),
       sessions.end());
 
   return sessions;
@@ -207,17 +207,7 @@ Status ApexSession::UpdateStateAndCommit(
   return Status::Success();
 }
 
-Status ApexSession::DeleteSession() const {
-  switch (GetState()) {
-    case SessionState::STAGED:
-      [[clang::fallthrough]];
-    case SessionState::VERIFIED:
-      return deleteSessionDir(GetId());
-    default:
-      return Status::Fail(StringLog()
-                          << "Can't delete session in state " << GetState());
-  }
-}
+Status ApexSession::DeleteSession() const { return deleteSessionDir(GetId()); }
 
 std::ostream& operator<<(std::ostream& out, const ApexSession& session) {
   return out << "[id = " << session.GetId()
