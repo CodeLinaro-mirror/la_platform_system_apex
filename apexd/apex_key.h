@@ -14,25 +14,18 @@
  * limitations under the License.
  */
 
-package android.apex.broadcastreceiver;
+#pragma once
 
-import android.app.Activity;
-import android.content.BroadcastReceiver;
-import android.content.IntentFilter;
-import android.os.Bundle;
+#include <string>
 
-/**
- * Main activity to listen to broadcast session updates.
- *
- */
-public class MainActivity extends Activity {
+#include "status.h"
+#include "status_or.h"
 
-    @Override
-    protected void onCreate(Bundle savedInstanceState) {
-        super.onCreate(savedInstanceState);
-        BroadcastReceiver br = new BroadcastReceiverActivity();
+namespace android {
+namespace apex {
 
-        IntentFilter filter = new IntentFilter("android.content.pm.action.SESSION_UPDATED");
-        this.registerReceiver(br, filter);
-    }
-}
+Status collectApexKeys(bool scanExternalKeys = false);
+StatusOr<const std::string> getApexKey(const std::string& key_name);
+
+}  // namespace apex
+}  // namespace android

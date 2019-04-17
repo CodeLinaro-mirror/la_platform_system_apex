@@ -17,8 +17,10 @@
 #ifndef ANDROID_APEXD_APEXD_UTILS_H_
 #define ANDROID_APEXD_APEXD_UTILS_H_
 
+#include <chrono>
 #include <filesystem>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include <dirent.h>
@@ -26,6 +28,7 @@
 #include <sys/types.h>
 #include <sys/wait.h>
 
+#include <android-base/chrono_utils.h>
 #include <android-base/logging.h>
 #include <cutils/android_reboot.h>
 
@@ -81,26 +84,29 @@ inline int ForkAndRun(const std::vector<std::string>& args,
 template <typename FilterFn>
 StatusOr<std::vector<std::string>> ReadDir(const std::string& path,
                                            FilterFn fn) {
-  // TODO use C++17's std::filesystem instead
-  auto d = std::unique_ptr<DIR, int (*)(DIR*)>(opendir(path.c_str()), closedir);
-  if (!d) {
+  namespace fs = std::filesystem;
+  fs::path file_path = path;
+  std::error_code ec;
+
+  if (!fs::is_directory(file_path, ec)) {
     return StatusOr<std::vector<std::string>>::MakeError(
-        PStringLog() << "Can't open " << path << " for reading");
+        StringLog() << "Can't open " << path << " for reading : " << ec);
   }
 
   std::vector<std::string> ret;
-  struct dirent* dp;
-  while ((dp = readdir(d.get())) != NULL) {
-    if ((strcmp(dp->d_name, ".") == 0) || (strcmp(dp->d_name, "..") == 0)) {
+  for (const auto& entry : fs::directory_iterator(file_path)) {
+    if (!fn(entry)) {
       continue;
     }
-    if (!fn(dp->d_type, dp->d_name)) {
-      continue;
-    }
-    ret.push_back(path + "/" + dp->d_name);
+    ret.push_back(file_path.string() + "/" + entry.path().filename().string());
   }
 
   return StatusOr<std::vector<std::string>>(std::move(ret));
+}
+
+inline bool IsEmptyDirectory(const std::string& path) {
+  auto res = ReadDir(path, [](auto _) { return true; });
+  return res.Ok() && res->empty();
 }
 
 inline Status createDirIfNeeded(const std::string& path, mode_t mode) {
@@ -130,7 +136,7 @@ inline Status createDirIfNeeded(const std::string& path, mode_t mode) {
 }
 
 inline Status DeleteDirContent(const std::string& path) {
-  auto files = ReadDir(path, [](auto _, auto __) { return true; });
+  auto files = ReadDir(path, [](auto _) { return true; });
   if (!files.Ok()) {
     return Status::Fail(StringLog() << "Failed to delete " << path << " : "
                                     << files.ErrorMessage());
@@ -163,6 +169,25 @@ inline void Reboot() {
   if (android_reboot(ANDROID_RB_RESTART2, 0, nullptr) != 0) {
     LOG(ERROR) << "Failed to reboot device";
   }
+}
+
+inline Status WaitForFile(const std::string& path,
+                          std::chrono::nanoseconds timeout) {
+  android::base::Timer t;
+  bool has_slept = false;
+  while (t.duration() < timeout) {
+    struct stat sb;
+    if (stat(path.c_str(), &sb) != -1) {
+      if (has_slept) {
+        LOG(INFO) << "wait for '" << path << "' took " << t;
+      }
+      return Status::Success();
+    }
+    std::this_thread::sleep_for(5ms);
+    has_slept = true;
+  }
+  return Status::Fail(PStringLog()
+                      << "wait for '" << path << "' timed out and took " << t);
 }
 
 }  // namespace apex
