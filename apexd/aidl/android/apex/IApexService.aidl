@@ -28,8 +28,11 @@ interface IApexService {
    ApexSessionInfo[] getSessions();
    ApexSessionInfo getStagedSessionInfo(int session_id);
    ApexInfo[] getActivePackages();
+   ApexInfo[] getAllPackages();
 
    void abortActiveSession();
+
+   void unstagePackages(in @utf8InCpp List<String> active_package_paths);
 
    /**
     * Returns the active package corresponding to |package_name| and null
@@ -67,4 +70,14 @@ interface IApexService {
     * functional on user builds.
     */
    boolean stagePackages(in @utf8InCpp List<String> package_tmp_paths);
+   /**
+    * Not meant for use outside of testing. The call will not be
+    * functional on user builds.
+    */
+   void rollbackActiveSession();
+   /**
+    * Not meant for use outside of testing. The call will not be
+    * functional on user builds.
+    */
+   void resumeRollbackIfNeeded();
 }
