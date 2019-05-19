@@ -15,8 +15,7 @@
  */
 
 #include "apexd_session.h"
-#include "apexd.h"
-#include "apexd_private.h"
+
 #include "apexd_utils.h"
 #include "status_or.h"
 #include "string_log.h"
@@ -116,9 +115,10 @@ StatusOr<ApexSession> ApexSession::GetSession(int session_id) {
 std::vector<ApexSession> ApexSession::GetSessions() {
   std::vector<ApexSession> sessions;
 
-  StatusOr<std::vector<std::string>> sessionPaths =
-      ReadDir(kApexSessionsDir, [](unsigned char d_type, const char* d_name) {
-        return (d_type == DT_DIR);
+  StatusOr<std::vector<std::string>> sessionPaths = ReadDir(
+      kApexSessionsDir, [](const std::filesystem::directory_entry& entry) {
+        std::error_code ec;
+        return entry.is_directory(ec);
       });
 
   if (!sessionPaths.Ok()) {
@@ -143,7 +143,7 @@ std::vector<ApexSession> ApexSession::GetSessionsInState(
   auto sessions = GetSessions();
   sessions.erase(
       std::remove_if(sessions.begin(), sessions.end(),
-                     [&](ApexSession s) { return s.GetState() != state; }),
+                     [&](const ApexSession &s) { return s.GetState() != state; }),
       sessions.end());
 
   return sessions;
@@ -175,6 +175,8 @@ bool ApexSession::IsFinalized() const {
     case SessionState::ACTIVATION_FAILED:
       [[fallthrough]];
     case SessionState::ROLLED_BACK:
+      [[fallthrough]];
+    case SessionState::ROLLBACK_FAILED:
       return true;
     default:
       return false;
@@ -207,17 +209,7 @@ Status ApexSession::UpdateStateAndCommit(
   return Status::Success();
 }
 
-Status ApexSession::DeleteSession() const {
-  switch (GetState()) {
-    case SessionState::STAGED:
-      [[clang::fallthrough]];
-    case SessionState::VERIFIED:
-      return deleteSessionDir(GetId());
-    default:
-      return Status::Fail(StringLog()
-                          << "Can't delete session in state " << GetState());
-  }
-}
+Status ApexSession::DeleteSession() const { return deleteSessionDir(GetId()); }
 
 std::ostream& operator<<(std::ostream& out, const ApexSession& session) {
   return out << "[id = " << session.GetId()
