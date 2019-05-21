@@ -58,11 +58,14 @@ Status deactivatePackage(const std::string& full_path) WARN_UNUSED;
 std::vector<ApexFile> getActivePackages();
 StatusOr<ApexFile> getActivePackage(const std::string& package_name);
 
+std::vector<ApexFile> getFactoryPackages();
+
 Status abortActiveSession();
 
 int onBootstrap();
 void onStart(CheckpointInterface* checkpoint_service);
 void onAllPackagesReady();
+void unmountDanglingMounts();
 
 }  // namespace apex
 }  // namespace android
