@@ -129,6 +129,15 @@ CheckpointInterface* gVoldService;
 bool gSupportsFsCheckpoints = false;
 bool gInFsCheckpointMode = false;
 
+// APEXEs for which a different version was activated than in the previous boot.
+// This can happen in the following scenarios:
+//  1. This APEX is part of the staged session that was applied during this
+//    boot.
+//  2. This is a compressed APEX that was decompressed during this boot.
+//  3. We failed to activate APEX from /data/apex/active and fallback to the
+//  pre-installed APEX.
+std::set<std::string> gChangedActiveApexes;
+
 static constexpr size_t kLoopDeviceSetupAttempts = 3u;
 
 // Please DO NOT add new modules to this list without contacting mainline-modularization@ first.
@@ -194,6 +203,7 @@ Result<void> PreAllocateLoopDevices() {
   for (const auto& path : *scan) {
     auto apex_file = ApexFile::Open(path);
     if (!apex_file.ok()) {
+      LOG(ERROR) << "Failed to open " << path << " : " << apex_file.error();
       continue;
     }
     size++;
@@ -1856,6 +1866,14 @@ Result<void> ActivateMissingApexes(const std::vector<ApexFileRef>& apexes,
       fallback_apexes.emplace_back(std::cref(apex_file));
     }
   }
+  if (mode == kBootMode) {
+    // Treat fallback to pre-installed APEXes as a change of the acitve APEX,
+    // since we are already in a pretty dire situation, so it's better if we
+    // drop all the caches.
+    for (const auto& apex : fallback_apexes) {
+      gChangedActiveApexes.insert(apex.get().GetManifest().name());
+    }
+  }
   return ActivateApexPackages(fallback_apexes, mode);
 }
 
@@ -2206,6 +2224,7 @@ void ScanStagedSessionsDirAndStage() {
       continue;
     }
 
+    std::vector<std::string> staged_apex_names;
     for (const auto& apex : apexes) {
       // TODO(b/158470836): Avoid opening ApexFile repeatedly.
       Result<ApexFile> apex_file = ApexFile::Open(apex);
@@ -2213,6 +2232,7 @@ void ScanStagedSessionsDirAndStage() {
         LOG(ERROR) << "Cannot open apex file during staging: " << apex;
         continue;
       }
+      staged_apex_names.push_back(apex_file->GetManifest().name());
     }
 
     const Result<void> result = StagePackages(apexes);
@@ -2227,6 +2247,10 @@ void ScanStagedSessionsDirAndStage() {
 
     // Session was OK, release scopeguard.
     scope_guard.Disable();
+
+    for (const std::string& apex : staged_apex_names) {
+      gChangedActiveApexes.insert(apex);
+    }
 
     auto st = session.UpdateStateAndCommit(SessionState::ACTIVATED);
     if (!st.ok()) {
@@ -2502,10 +2526,14 @@ int OnBootstrap() {
     LOG(ERROR) << status.error();
     return 1;
   }
-  pre_allocate = loop::PreAllocateLoopDevices(*block_count);
-  if (!pre_allocate.ok()) {
-    LOG(ERROR) << "Failed to pre-allocate loop devices for block apexes : "
-               << pre_allocate.error();
+  if (*block_count > 0) {
+    LOG(INFO) << "Pre-allocation " << *block_count
+              << " loop devices for block APEXes";
+    pre_allocate = loop::PreAllocateLoopDevices(*block_count);
+    if (!pre_allocate.ok()) {
+      LOG(ERROR) << "Failed to pre-allocate loop devices for block apexes : "
+                 << pre_allocate.error();
+    }
   }
 
   DeviceMapper& dm = DeviceMapper::Instance();
@@ -2852,6 +2880,7 @@ Result<ApexFile> ProcessCompressedApex(const ApexFile& capex,
     return Error() << "Failed to decompress CAPEX: " << return_apex.error();
   }
 
+  gChangedActiveApexes.insert(return_apex->GetManifest().name());
   /// Release compressed blocks in case decompression_dest is on f2fs-compressed
   // filesystem.
   ReleaseF2fsCompressedBlocks(decompression_dest);
@@ -2983,18 +3012,6 @@ void OnStart() {
         ProcessCompressedApex(compressed_apex, /* is_ota_chroot= */ false);
     for (const ApexFile& apex_file : decompressed_apex) {
       activation_list.emplace_back(std::cref(apex_file));
-    }
-  }
-
-  int data_apex_cnt = std::count_if(
-      activation_list.begin(), activation_list.end(), [](const auto& a) {
-        return !ApexFileRepository::GetInstance().IsPreInstalledApex(a.get());
-      });
-  if (data_apex_cnt > 0) {
-    Result<void> pre_allocate = loop::PreAllocateLoopDevices(data_apex_cnt);
-    if (!pre_allocate.ok()) {
-      LOG(ERROR) << "Failed to pre-allocate loop devices : "
-                 << pre_allocate.error();
     }
   }
 
@@ -3495,8 +3512,10 @@ Result<int> AddBlockApex(ApexFileRepository& instance) {
 // - ActivateApexPackages
 // - setprop apexd.status: activated/ready
 int OnStartInVmMode() {
-  // waits for /dev/loop-control
-  loop::PreAllocateLoopDevices(0);
+  Result<void> loop_ready = WaitForFile("/dev/loop-control", 20s);
+  if (!loop_ready.ok()) {
+    LOG(ERROR) << loop_ready.error();
+  }
 
   // Create directories for APEX shared libraries.
   if (auto status = CreateSharedLibsApexDir(); !status.ok()) {
@@ -3757,9 +3776,7 @@ Result<void> VerifyPackageNonStagedInstall(const ApexFile& apex_file) {
   return RunVerifyFnInsideTempMount(apex_file, check_fn, true);
 }
 
-Result<void> CheckSupportsNonStagedInstall(const ApexFile& cur_apex,
-                                           const ApexFile& new_apex) {
-  const auto& cur_manifest = cur_apex.GetManifest();
+Result<void> CheckSupportsNonStagedInstall(const ApexFile& new_apex) {
   const auto& new_manifest = new_apex.GetManifest();
 
   if (!new_manifest.supportsrebootlessupdate()) {
@@ -3789,25 +3806,6 @@ Result<void> CheckSupportsNonStagedInstall(const ApexFile& cur_apex,
   // We don't allow non-staged updates of APEXES that have java libs inside.
   if (new_manifest.jnilibs_size() > 0) {
     return Error() << new_apex.GetPath() << " requires JNI libs";
-  }
-
-  // For requireNativeLibs bit, we only allow updates that don't change list of
-  // required libs.
-
-  std::vector<std::string> cur_required_libs(
-      cur_manifest.requirenativelibs().begin(),
-      cur_manifest.requirenativelibs().end());
-  sort(cur_required_libs.begin(), cur_required_libs.end());
-
-  std::vector<std::string> new_required_libs(
-      new_manifest.requirenativelibs().begin(),
-      new_manifest.requirenativelibs().end());
-  sort(new_required_libs.begin(), new_required_libs.end());
-
-  if (cur_required_libs != new_required_libs) {
-    return Error() << "Set of native libs required by " << new_apex.GetPath()
-                   << " differs from the one required by the currently active "
-                   << cur_apex.GetPath();
   }
 
   auto expected_public_key =
@@ -3895,6 +3893,40 @@ Result<void> UpdateApexInfoList() {
   return {};
 }
 
+// TODO(b/238820991) Handle failures
+void UnloadApexFromInit(const std::string& apex_name) {
+  if (!SetProperty(kCtlApexUnloadSysprop, apex_name)) {
+    // When failed to SetProperty(), there's nothing we can do here.
+    // Log error and return early to avoid indefinite waiting for ack.
+    PLOG(ERROR) << "Failed to set " << kCtlApexUnloadSysprop << " to "
+                << apex_name;
+    return;
+  }
+  const static auto kTimeoutForUnloading = 10s;
+  const auto init_apex_prop_name = "init.apex." + apex_name;
+  if (!base::WaitForProperty(init_apex_prop_name, kInitApexUnloaded,
+                             kTimeoutForUnloading)) {
+    PLOG(ERROR) << "Failed to wait for init to unload " << apex_name;
+  }
+}
+
+// TODO(b/238820991) Handle failures
+void LoadApexFromInit(const std::string& apex_name) {
+  if (!SetProperty(kCtlApexLoadSysprop, apex_name)) {
+    // When failed to SetProperty(), there's nothing we can do here.
+    // Log error and return early to avoid indefinite waiting for ack.
+    PLOG(ERROR) << "Failed to set " << kCtlApexLoadSysprop << " to "
+                << apex_name;
+    return;
+  }
+  const static auto kTimeoutForLoading = 10s;
+  const auto init_apex_prop_name = "init.apex." + apex_name;
+  if (!base::WaitForProperty(init_apex_prop_name, kInitApexLoaded,
+                             kTimeoutForLoading)) {
+    PLOG(ERROR) << "Failed to wait for init to load " << apex_name;
+  }
+}
+
 Result<ApexFile> InstallPackage(const std::string& package_path) {
   LOG(INFO) << "Installing " << package_path;
   auto temp_apex = ApexFile::Open(package_path);
@@ -3917,7 +3949,7 @@ Result<ApexFile> InstallPackage(const std::string& package_path) {
   // Do a quick check if this APEX can be installed without a reboot.
   // Note that passing this check doesn't guarantee that APEX will be
   // successfully installed.
-  if (auto r = CheckSupportsNonStagedInstall(*cur_apex, *temp_apex); !r.ok()) {
+  if (auto r = CheckSupportsNonStagedInstall(*temp_apex); !r.ok()) {
     return r.error();
   }
 
@@ -3936,6 +3968,15 @@ Result<ApexFile> InstallPackage(const std::string& package_path) {
 
   std::string new_id = GetPackageId(temp_apex->GetManifest()) + "_" +
                        std::to_string(*new_id_minor);
+
+  // Before unmounting the current apex, unload it from the init process:
+  // terminates services started from the apex and init scripts read from the
+  // apex.
+  UnloadApexFromInit(module_name);
+
+  // And then reload it from the init process whether it succeeds or not.
+  auto reload_apex =
+      android::base::make_scope_guard([&]() { LoadApexFromInit(module_name); });
 
   // 2. Unmount currently active APEX.
   if (auto res = UnmountPackage(*cur_apex, /* allow_latest= */ true,
@@ -4003,6 +4044,15 @@ Result<ApexFile> InstallPackage(const std::string& package_path) {
   ReleaseF2fsCompressedBlocks(target_file);
 
   return new_apex;
+}
+
+bool IsActiveApexChanged(const ApexFile& apex) {
+  return gChangedActiveApexes.find(apex.GetManifest().name()) !=
+         gChangedActiveApexes.end();
+}
+
+std::set<std::string>& GetChangedActiveApexesForTesting() {
+  return gChangedActiveApexes;
 }
 
 }  // namespace apex
