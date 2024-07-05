@@ -717,6 +717,8 @@ Result<void> Unmount(const MountedApexData& data, bool deferred) {
   return {};
 }
 
+namespace {
+
 void SendApexInstallationRequestedAtom(const std::string& package_path,
                                        const bool is_rollback,
                                        const unsigned int install_type) {
@@ -756,13 +758,13 @@ void SendApexInstallationRequestedAtom(const std::string& package_path,
   }
 }
 
-void SendApexInstallationEndedAtom(const std::string apex_package_path,
+void SendApexInstallationEndedAtom(const std::string& package_path,
                                    int install_result) {
   if (!statssocket::lazy::IsAvailable()) {
     LOG(WARNING) << "Unable to send Apex Atom; libstatssocket is not available";
     return;
   }
-  Result<std::string> apex_file_sha256_str = CalculateSha256(apex_package_path);
+  Result<std::string> apex_file_sha256_str = CalculateSha256(package_path);
   if (!apex_file_sha256_str.ok()) {
     LOG(WARNING) << "Unable to get sha256 of ApexFile: "
                  << apex_file_sha256_str.error();
@@ -774,8 +776,6 @@ void SendApexInstallationEndedAtom(const std::string apex_package_path,
     LOG(WARNING) << "Failed to report apex_installation_ended stats";
   }
 }
-
-namespace {
 
 template <typename VerifyFn>
 Result<void> RunVerifyFnInsideTempMount(const ApexFile& apex,
@@ -3054,6 +3054,9 @@ void OnStart() {
     }
   }
 
+  // Clean up inactive APEXes on /data. We don't need them anyway.
+  RemoveInactiveDataApex();
+
   // Now that APEXes are mounted, snapshot or restore DE_sys data.
   SnapshotOrRestoreDeSysData();
 
@@ -3291,8 +3294,6 @@ void DeleteUnusedVerityDevices() {
 }
 
 void BootCompletedCleanup() {
-  RemoveInactiveDataApex();
-
   auto sessions = gSessionManager->GetSessions();
   for (const ApexSession& session : sessions) {
     if (!session.IsFinalized()) {
@@ -3524,13 +3525,23 @@ Result<void> ReserveSpaceForCompressedApex(int64_t size,
                         << file_path.c_str();
   }
 
-  // Resize to required size
+  // Resize to required size, posix_fallocate will not shrink files so resize
+  // is needed.
   std::error_code ec;
   std::filesystem::resize_file(file_path, size, ec);
   if (ec) {
     RemoveFileIfExists(file_path);
     return ErrnoError() << "Failed to resize file " << file_path.c_str()
                         << " : " << ec.message();
+  }
+
+  // Allocate blocks for the requested size.
+  // resize_file will create sparse file with 0 blocks on filesystems that
+  // supports sparse files.
+  if ((errno = posix_fallocate(dest_fd.get(), 0, size))) {
+    RemoveFileIfExists(file_path);
+    return ErrnoError() << "Failed to allocate blocks for file "
+                        << file_path.c_str();
   }
 
   return {};
@@ -3904,23 +3915,6 @@ Result<void> LoadApexFromInit(const std::string& apex_name) {
   return {};
 }
 
-Result<ApexFile> InstallPackage(const std::string& package_path, bool force) {
-  LOG(INFO) << "Installing " << package_path;
-  SendApexInstallationRequestedAtom(
-      package_path, /* is_rollback */ false,
-      stats::apex::APEX_INSTALLATION_REQUESTED__INSTALLATION_TYPE__REBOOTLESS);
-  // TODO: Add error-enums
-  Result<ApexFile> ret = InstallPackageImpl(package_path, force);
-  SendApexInstallationEndedAtom(
-      package_path,
-      ret.ok()
-          ? stats::apex::
-                APEX_INSTALLATION_ENDED__INSTALLATION_RESULT__INSTALL_SUCCESSFUL
-          : stats::apex::
-                APEX_INSTALLATION_ENDED__INSTALLATION_RESULT__INSTALL_FAILURE_APEX_INSTALLATION);
-  return ret;
-}
-
 Result<ApexFile> InstallPackageImpl(const std::string& package_path,
                                     bool force) {
   auto temp_apex = ApexFile::Open(package_path);
@@ -4043,6 +4037,23 @@ Result<ApexFile> InstallPackageImpl(const std::string& package_path,
   ReleaseF2fsCompressedBlocks(target_file);
 
   return new_apex;
+}
+
+Result<ApexFile> InstallPackage(const std::string& package_path, bool force) {
+  LOG(INFO) << "Installing " << package_path;
+  SendApexInstallationRequestedAtom(
+      package_path, /* is_rollback */ false,
+      stats::apex::APEX_INSTALLATION_REQUESTED__INSTALLATION_TYPE__REBOOTLESS);
+  // TODO: Add error-enums
+  Result<ApexFile> ret = InstallPackageImpl(package_path, force);
+  SendApexInstallationEndedAtom(
+      package_path,
+      ret.ok()
+          ? stats::apex::
+                APEX_INSTALLATION_ENDED__INSTALLATION_RESULT__INSTALL_SUCCESSFUL
+          : stats::apex::
+                APEX_INSTALLATION_ENDED__INSTALLATION_RESULT__INSTALL_FAILURE_APEX_INSTALLATION);
+  return ret;
 }
 
 bool IsActiveApexChanged(const ApexFile& apex) {
