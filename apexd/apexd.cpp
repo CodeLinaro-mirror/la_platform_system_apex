@@ -28,7 +28,6 @@
 #include <android-base/scopeguard.h>
 #include <android-base/stringprintf.h>
 #include <android-base/strings.h>
-#include <android-base/thread_annotations.h>
 #include <android-base/unique_fd.h>
 #include <dirent.h>
 #include <fcntl.h>
@@ -140,17 +139,6 @@ ApexSessionManager* gSessionManager;
 CheckpointInterface* gVoldService;
 bool gSupportsFsCheckpoints = false;
 bool gInFsCheckpointMode = false;
-
-// Process-wise global mutex to serialize install/staging functions:
-// - submitStagedSession
-// - markStagedSessionReady
-// - installAndActivatePackage
-// This is to ensure that there's no overlapping between install/staging.
-// To be specific, we don't want to perform verification when there's a
-// VERIFIED session, which is not yet fully staged.
-struct Mutex : std::mutex {
-  const Mutex& operator!() const { return *this; }  // for negative capability
-} gInstallLock;
 
 // APEXEs for which a different version was activated than in the previous boot.
 // This can happen in the following scenarios:
@@ -695,20 +683,12 @@ Result<void> VerifyPackageBoot(const ApexFile& apex_file) {
 Result<void> VerifyNoOverlapInSessions(std::span<const ApexFile> apex_files,
                                        std::span<const ApexSession> sessions) {
   for (const auto& session : sessions) {
-    // We don't want to install/stage while another session is being staged.
-    if (session.GetState() == SessionState::VERIFIED) {
-      return Error() << "Session " << session.GetId() << " is being staged.";
-    }
-
-    // We don't want to install/stage if the same package is already staged.
-    if (session.GetState() == SessionState::STAGED) {
-      for (const auto& apex : apex_files) {
-        if (std::ranges::contains(session.GetApexNames(),
-                                  apex.GetManifest().name())) {
-          return Error() << "APEX " << apex.GetManifest().name()
-                         << " is already staged by session " << session.GetId()
-                         << ".";
-        }
+    for (const auto& apex : apex_files) {
+      if (std::ranges::contains(session.GetApexNames(),
+                                apex.GetManifest().name())) {
+        return Error() << "APEX " << apex.GetManifest().name()
+                       << " is already staged by session " << session.GetId()
+                       << ".";
       }
     }
   }
@@ -736,19 +716,16 @@ Result<VerificationResult> VerifyPackagesStagedInstall(
     }
   }
 
-  auto sessions = gSessionManager->GetSessions();
+  auto staged_sessions =
+      gSessionManager->GetSessionsInState(SessionState::STAGED);
 
-  // Check overlapping: reject if the same package is already staged
-  // or if there's a session being staged.
-  OR_RETURN(VerifyNoOverlapInSessions(apex_files, sessions));
+  // Check overlapping: reject if the same package is already staged.
+  OR_RETURN(VerifyNoOverlapInSessions(apex_files, staged_sessions));
 
   // Since there can be multiple staged sessions, let's verify incoming APEXes
   // with all staged apexes mounted.
   std::vector<ApexFile> all_apex_files;
-  for (const auto& session : sessions) {
-    if (session.GetState() != SessionState::STAGED) {
-      continue;
-    }
+  for (const auto& session : staged_sessions) {
     auto session_id = session.GetId();
     auto child_session_ids = session.GetChildSessionIds();
     auto staged_apex_files = OpenSessionApexFiles(
@@ -1417,8 +1394,7 @@ std::vector<ApexFile> GetFactoryPackages() {
  *
  * Returns without error only if session was successfully aborted.
  **/
-Result<void> AbortStagedSession(int session_id) REQUIRES(!gInstallLock) {
-  auto install_guard = std::scoped_lock{gInstallLock};
+Result<void> AbortStagedSession(int session_id) {
   auto session = gSessionManager->GetSession(session_id);
   if (!session.ok()) {
     return Error() << "No session found with id " << session_id;
@@ -2806,8 +2782,7 @@ void OnAllPackagesReady() {
 Result<std::vector<ApexFile>> SubmitStagedSession(
     const int session_id, const std::vector<int>& child_session_ids,
     const bool has_rollback_enabled, const bool is_rollback,
-    const int rollback_id) REQUIRES(!gInstallLock) {
-  auto install_guard = std::scoped_lock{gInstallLock};
+    const int rollback_id) {
   auto event = InstallRequestedEvent(InstallType::Staged, is_rollback);
 
   if (session_id == 0) {
@@ -2878,9 +2853,7 @@ Result<std::vector<ApexFile>> SubmitStagedSession(
   return ret;
 }
 
-Result<void> MarkStagedSessionReady(const int session_id)
-    REQUIRES(!gInstallLock) {
-  auto install_guard = std::scoped_lock{gInstallLock};
+Result<void> MarkStagedSessionReady(const int session_id) {
   auto session = gSessionManager->GetSession(session_id);
   if (!session.ok()) {
     return session.error();
@@ -3423,11 +3396,11 @@ Result<VerificationResult> VerifyPackageNonStagedInstall(
     const ApexFile& apex_file, bool force) {
   OR_RETURN(VerifyPackageBoot(apex_file));
 
-  auto sessions = gSessionManager->GetSessions();
+  auto staged_sessions =
+      gSessionManager->GetSessionsInState(SessionState::STAGED);
 
-  // Check overlapping: reject if the same package is already staged
-  // or if there's a session being staged.
-  OR_RETURN(VerifyNoOverlapInSessions(Single(apex_file), sessions));
+  // Check overlapping: reject if the same package is already staged.
+  OR_RETURN(VerifyNoOverlapInSessions(Single(apex_file), staged_sessions));
 
   auto check_fn =
       [&apex_file,
@@ -3587,9 +3560,7 @@ Result<void> LoadApexFromInit(const std::string& apex_name) {
   return {};
 }
 
-Result<ApexFile> InstallPackage(const std::string& package_path, bool force)
-    REQUIRES(!gInstallLock) {
-  auto install_guard = std::scoped_lock{gInstallLock};
+Result<ApexFile> InstallPackage(const std::string& package_path, bool force) {
   auto event = InstallRequestedEvent(InstallType::NonStaged,
                                      /*is_rollback=*/false);
 

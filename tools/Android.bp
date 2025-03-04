@@ -21,6 +21,11 @@ python_binary_host {
     srcs: [
         "deapexer.py",
     ],
+    version: {
+        py3: {
+            embedded_launcher: true,
+        },
+    },
     libs: [
         "apex_manifest",
     ],
@@ -36,6 +41,11 @@ python_binary_host {
     srcs: [
         "apex_elf_checker.py",
     ],
+    version: {
+        py3: {
+            embedded_launcher: true,
+        },
+    },
     required: [
         "blkid_static",
         "debugfs_static",
@@ -48,6 +58,11 @@ python_binary_host {
     srcs: [
         "apex_compression_tool.py",
     ],
+    version: {
+        py3: {
+            embedded_launcher: true,
+        },
+    },
     libs: [
         "apex_manifest_proto",
     ],
@@ -80,6 +95,11 @@ python_test_host {
     test_suites: ["general-tests"],
     test_options: {
         unit_test: true,
+    },
+    version: {
+        py3: {
+            embedded_launcher: true,
+        },
     },
 }
 
@@ -135,6 +155,11 @@ python_binary_host {
     srcs: [
         "apexer_with_DCLA_preprocessing.py",
     ],
+    version: {
+        py3: {
+            embedded_launcher: true,
+        },
+    },
     libs: [
         "apexer_wrapper_utils",
     ],
@@ -161,6 +186,11 @@ python_test_host {
     test_options: {
         unit_test: true,
     },
+    version: {
+        py3: {
+            embedded_launcher: true,
+        },
+    },
 }
 
 python_binary_host {
@@ -168,6 +198,11 @@ python_binary_host {
     srcs: [
         "apexer_with_trim_preprocessing.py",
     ],
+    version: {
+        py3: {
+            embedded_launcher: true,
+        },
+    },
     libs: [
         "apex_manifest_proto",
         "apexer_wrapper_utils",
@@ -177,6 +212,11 @@ python_binary_host {
 python_binary_host {
     name: "apexd_host",
     srcs: ["apexd_host.py"],
+    version: {
+        py3: {
+            embedded_launcher: true,
+        },
+    },
     libs: [
         "apex_manifest",
     ],
