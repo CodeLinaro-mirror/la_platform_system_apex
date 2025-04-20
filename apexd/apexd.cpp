@@ -37,7 +37,6 @@
 #include <libdm/dm.h>
 #include <libdm/dm_table.h>
 #include <libdm/dm_target.h>
-#include <linux/f2fs.h>
 #include <linux/loop.h>
 #include <selinux/android.h>
 #include <stdlib.h>
@@ -212,31 +211,6 @@ bool IsBootstrapApex(const ApexFile& apex) {
                    apex.GetManifest().name()) != kBootstrapApexes.end() ||
          std::find(additional.begin(), additional.end(),
                    apex.GetManifest().name()) != additional.end();
-}
-
-void ReleaseF2fsCompressedBlocks(const std::string& file_path) {
-  unique_fd fd(
-      TEMP_FAILURE_RETRY(open(file_path.c_str(), O_RDONLY | O_CLOEXEC, 0)));
-  if (fd.get() == -1) {
-    PLOG(ERROR) << "Failed to open " << file_path;
-    return;
-  }
-  unsigned int flags;
-  if (ioctl(fd, FS_IOC_GETFLAGS, &flags) == -1) {
-    PLOG(ERROR) << "Failed to call FS_IOC_GETFLAGS on " << file_path;
-    return;
-  }
-  if ((flags & FS_COMPR_FL) == 0) {
-    // Doesn't support f2fs-compression.
-    return;
-  }
-  uint64_t blk_cnt;
-  if (ioctl(fd, F2FS_IOC_RELEASE_COMPRESS_BLOCKS, &blk_cnt) == -1) {
-    PLOG(ERROR) << "Failed to call F2FS_IOC_RELEASE_COMPRESS_BLOCKS on "
-                << file_path;
-  }
-  LOG(INFO) << "Released " << blk_cnt << " compressed blocks from "
-            << file_path;
 }
 
 std::unique_ptr<DmTable> CreateVerityTable(const ApexVerityData& verity_data,
@@ -465,8 +439,8 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
   DmDevice linear_dev;
 
   if (IsMountBeforeDataEnabled() && GetImageManager()->IsPinnedApex(apex)) {
-    linear_dev =
-        OR_RETURN(CreateDmLinearForPayload(apex, device_name + ".payload"));
+    linear_dev = OR_RETURN(
+        CreateDmLinearForPayload(apex, device_name + kDmLinearPayloadSuffix));
     block_device = linear_dev.GetDevPath();
   } else {
     loop = OR_RETURN(CreateLoopForApex(apex));
@@ -1924,9 +1898,11 @@ void DeleteDePreRestoreSnapshots(const ApexSession& session) {
   }
 }
 
-void OnBootCompleted() { ApexdLifecycle::GetInstance().MarkBootCompleted(); }
+void MarkBootCompleted() { ApexdLifecycle::GetInstance().MarkBootCompleted(); }
 
-Result<std::vector<std::string>> ActivateStagedSession(
+// Moves all apexes in the session to "active" state in a transactional manner.
+// Returns the name list of the apexes in the session on success.
+Result<std::vector<std::string>> TryActivateStagedSession(
     const ApexSession& session) {
   std::string build_fingerprint = GetProperty(kBuildFingerprintSysprop, "");
   if (session.GetBuildFingerprint().compare(build_fingerprint) != 0) {
@@ -1967,19 +1943,17 @@ Result<std::vector<std::string>> ActivateStagedSession(
       apex_names_in_session.push_back(apex_file.GetManifest().name());
     }
 
+    std::vector<ApexListEntry> new_entries;
+    new_entries.reserve(images.size());
+    for (size_t i = 0; i < images.size(); i++) {
+      new_entries.emplace_back(images[i], apex_names_in_session[i]);
+    }
     // Now, update "active" list
     auto active_list =
         OR_RETURN(image_manager->GetApexList(ApexListType::ACTIVE));
-    // First, remove previously active apexes of newly activated packages
-    std::erase_if(active_list, [&](const auto& entry) {
-      return std::ranges::contains(apex_names_in_session, entry.apex_name);
-    });
-    // Then, add new apexes to the list
-    for (size_t i = 0; i < images.size(); i++) {
-      active_list.emplace_back(images[i], apex_names_in_session[i]);
-    }
-    // Finally, save it in the /metadata partition
-    OR_RETURN(image_manager->UpdateApexList(ApexListType::ACTIVE, active_list));
+    OR_RETURN(image_manager->UpdateApexList(
+        ApexListType::ACTIVE,
+        UpdateApexListWithNewEntries(std::move(active_list), new_entries)));
 
     // Let's keep mapped devices because they needs to be mapped as "active" in
     // ScanDataApexFiles().
@@ -2022,7 +1996,7 @@ void ActivateStagedSessions() {
 
   for (auto& session : sessions_to_activate) {
     auto session_id = session.GetId();
-    auto packages = ActivateStagedSession(session);
+    auto packages = TryActivateStagedSession(session);
     if (!packages.ok()) {
       LOG(ERROR) << packages.error();
       session.SetErrorMessage(packages.error().message());
@@ -2306,6 +2280,21 @@ void PrepareResources(size_t loop_device_cnt,
   }
 }
 
+// Note that this needs to be called before scanning data apexes because revert
+// or activation may change the active set of data apexes. For example, revert
+// restores the active apexes from the last backup.
+void ProcessSessions() {
+  // If there's any pending revert, revert active sessions.
+  auto status = ResumeRevertIfNeeded();
+  if (!status.ok()) {
+    LOG(ERROR) << "Failed to resume revert : " << status.error();
+  }
+  // Then, activate STAGED sessions. Note that if ResumeRevertIfNeeded() had
+  // reverted active sessions, any STAGED sessions are all aborted and there's
+  // nothing to activate.
+  ActivateStagedSessions();
+}
+
 std::vector<ApexFile> ScanDataApexFiles(ApexImageManager* manager) {
   CHECK(IsMountBeforeDataEnabled());
   auto image_list = manager->GetApexList(ApexListType::ACTIVE);
@@ -2348,19 +2337,11 @@ int OnBootstrap() {
   std::vector<ApexFileRef> activation_list;
 
   if (IsMountBeforeDataEnabled()) {
-    // Before scanning "active" data apexes, we need to apply any pending
-    // changes:
-    // - First, activate staged sessions. Apexes in staged sessions will be
-    //   marked as "active".
-    // - Second, resume any pending reverts. Revert will discard all active
-    //   sessions and restore the last known good "active" list.
-
-    ActivateStagedSessions();
-    if (auto result = ResumeRevertIfNeeded(); !result.ok()) {
-      LOG(ERROR) << "Failed to resume revert : " << result.error();
-    }
-
-    // Continue to scan active apexes and activate them.
+    // Process sessions before scanning "active" data apexes because sessions
+    // can change the list of active data apexes:
+    // - if there's a pending revert, then reverts all active sessions.
+    // - if there's staged sessions, then activate them first.
+    ProcessSessions();
     auto data_apexes = ScanDataApexFiles(GetImageManager());
     instance.AddDataApexFiles(std::move(data_apexes));
     activation_list = SelectApexForActivation();
@@ -2688,9 +2669,6 @@ Result<ApexFile> ProcessCompressedApex(const ApexFile& capex,
   }
 
   gChangedActiveApexes.insert(return_apex->GetManifest().name());
-  /// Release compressed blocks in case decompression_dest is on f2fs-compressed
-  // filesystem.
-  ReleaseF2fsCompressedBlocks(decompression_dest);
 
   scope_guard.Disable();
   return return_apex;
@@ -2750,49 +2728,16 @@ Result<void> ValidateDecompressedApex(const ApexFile& capex,
   return {};
 }
 
-void OnStart() {
-  ATRACE_NAME("OnStart");
-  LOG(INFO) << "Marking APEXd as starting";
-  auto time_started = boot_clock::now();
-  if (!SetProperty(gConfig->apex_status_sysprop, kApexStatusStarting)) {
-    PLOG(ERROR) << "Failed to set " << gConfig->apex_status_sysprop << " to "
-                << kApexStatusStarting;
-  }
-
-  // Ask whether we should revert any active sessions; this can happen if
-  // we've exceeded the retry count on a device that supports filesystem
-  // checkpointing.
-  if (gSupportsFsCheckpoints) {
-    Result<bool> needs_revert = gVoldService->NeedsRollback();
-    if (!needs_revert.ok()) {
-      LOG(ERROR) << "Failed to check if we need a revert: "
-                 << needs_revert.error();
-    } else if (*needs_revert) {
-      LOG(INFO) << "Exceeded number of session retries ("
-                << kNumRetriesWhenCheckpointingEnabled
-                << "). Starting a revert";
-      RevertActiveSessions("", "");
-    }
-  }
-
-  // Create directories for APEX shared libraries.
-  auto sharedlibs_apex_dir = CreateSharedLibsApexDir();
-  if (!sharedlibs_apex_dir.ok()) {
-    LOG(ERROR) << sharedlibs_apex_dir.error();
-  }
-
+void ActivateApexesOnStart() {
+  // Process sessions before adding data apexes.
   // If there is any new apex to be installed on /data/app-staging, hardlink
   // them to /data/apex/active first.
-  ActivateStagedSessions();
+  ProcessSessions();
+
   if (auto status = ApexFileRepository::GetInstance().AddDataApex(
           gConfig->active_apex_data_dir);
       !status.ok()) {
     LOG(ERROR) << "Failed to collect data APEX files : " << status.error();
-  }
-
-  auto status = ResumeRevertIfNeeded();
-  if (!status.ok()) {
-    LOG(ERROR) << "Failed to resume revert : " << status.error();
   }
 
   // Group every ApexFile on device by name
@@ -2836,9 +2781,44 @@ void OnStart() {
       LOG(ERROR) << retry_status.error();
     }
   }
+}
 
-  // Clean up inactive APEXes on /data. We don't need them anyway.
-  RemoveInactiveDataApex();
+void OnStart() {
+  ATRACE_NAME("OnStart");
+  LOG(INFO) << "Marking APEXd as starting";
+  auto time_started = boot_clock::now();
+  if (!SetProperty(gConfig->apex_status_sysprop, kApexStatusStarting)) {
+    PLOG(ERROR) << "Failed to set " << gConfig->apex_status_sysprop << " to "
+                << kApexStatusStarting;
+  }
+
+  // Ask whether we should revert any active sessions; this can happen if
+  // we've exceeded the retry count on a device that supports filesystem
+  // checkpointing.
+  if (gSupportsFsCheckpoints) {
+    Result<bool> needs_revert = gVoldService->NeedsRollback();
+    if (!needs_revert.ok()) {
+      LOG(ERROR) << "Failed to check if we need a revert: "
+                 << needs_revert.error();
+    } else if (*needs_revert) {
+      LOG(INFO) << "Exceeded number of session retries ("
+                << kNumRetriesWhenCheckpointingEnabled
+                << "). Starting a revert";
+      RevertActiveSessions("", "");
+    }
+  }
+
+  // Create directories for APEX shared libraries.
+  auto sharedlibs_apex_dir = CreateSharedLibsApexDir();
+  if (!sharedlibs_apex_dir.ok()) {
+    LOG(ERROR) << sharedlibs_apex_dir.error();
+  }
+
+  // TODO(b/381175707) until migration is finished, OnStart should activate both
+  // locations: /data/apex/active + pinned apexes
+  if (!IsMountBeforeDataEnabled()) {
+    ActivateApexesOnStart();
+  }
 
   // Now that APEXes are mounted, snapshot or restore DE_sys data.
   SnapshotOrRestoreDeSysData();
@@ -2964,11 +2944,6 @@ Result<std::vector<ApexFile>> SubmitStagedSession(
     return commit_status.error();
   }
 
-  for (const auto& apex : ret) {
-    // Release compressed blocks in case /data is f2fs-compressed filesystem.
-    ReleaseF2fsCompressedBlocks(apex.GetPath());
-  }
-
   event.MarkSucceeded();
 
   return ret;
@@ -3055,6 +3030,56 @@ void RemoveInactiveDataApex() {
       }
     }
   }
+
+  // Update the active list first and remove unused pinned images. Note that
+  // not every apex in active list is activated in case the preinstalled
+  // APEXes may have changed due to OTA.
+
+  auto image_manager = GetImageManager();
+  std::vector<ApexListEntry> active_list;
+  if (auto st = image_manager->GetApexList(ApexListType::ACTIVE); st.ok()) {
+    active_list = std::move(*st);
+  } else {
+    LOG(ERROR) << "Failed to get active apex list: " << st.error();
+    return;
+  }
+  // Remove skipped entries from ACTIVE list.
+  std::erase_if(active_list, [&](const auto& entry) {
+    auto path = image_manager->GetMappedPath(entry.image_name);
+    return !path || !apexd_private::IsMounted(path.value());
+  });
+  // Then, update the list
+  if (auto st =
+          image_manager->UpdateApexList(ApexListType::ACTIVE, active_list);
+      !st.ok()) {
+    LOG(ERROR) << "Failed to update active apex list: " << st.error();
+  }
+
+  // Now, remove unused pinned images.
+
+  // We've already checked that active_list contains what's actually activated.
+  std::unordered_set<std::string> images_in_use;
+  for (const auto& entry : active_list) {
+    images_in_use.insert(entry.image_name);
+  }
+
+  // If there are sessions not yet deleted, apex images referenced by them are
+  // also considered as being in use.
+  // TODO(b/409309264) clarify if there IS non-finalized session at this point.
+  for (const auto& session : gSessionManager->GetSessions()) {
+    images_in_use.insert_range(session.GetApexImages());
+  }
+
+  for (const auto& image : image_manager->GetAllImages()) {
+    if (images_in_use.contains(image)) {
+      continue;
+    }
+    LOG(INFO) << "Removing inactive pinned APEX image: " << image;
+    if (auto st = image_manager->UnmapAndDeleteImage(image); !st.ok()) {
+      LOG(ERROR) << "Failed to remove pinned APEX image: " << image << ": "
+                 << st.error();
+    }
+  }
 }
 
 bool IsApexDevice(const std::string& dev_name) {
@@ -3087,8 +3112,12 @@ void DeleteUnusedVerityDevices() {
   }
 }
 
-void BootCompletedCleanup() {
+void BootCompletedCleanup() REQUIRES(!gInstallLock) {
+  auto install_guard = std::scoped_lock{gInstallLock};
   gSessionManager->DeleteFinalizedSessions();
+
+  RemoveInactiveDataApex();
+
   DeleteUnusedVerityDevices();
 }
 
@@ -3561,6 +3590,11 @@ Result<size_t> ComputePackageIdMinor(const ApexFile& apex) {
   size_t next_minor = 1;
   for (const auto& dm_device : dm_devices) {
     std::string_view dm_name(dm_device.name());
+    // Skip .payload and .apex dm-linear devices
+    if (dm_name.ends_with(kDmLinearPayloadSuffix) ||
+        dm_name.ends_with(kDmLinearApexSuffix)) {
+      continue;
+    }
     // Format is <module_name>@<version_code>[_<minor>]
     if (!ConsumePrefix(&dm_name, apex.GetManifest().name())) {
       continue;
@@ -3681,22 +3715,16 @@ Result<ApexFile> InstallPackage(const std::string& package_path, bool force)
     }
   });
 
-  // 2. Unmount currently active APEX.
-  if (auto res =
-          UnmountPackage(*cur_apex, /* allow_latest= */ true,
-                         /* deferred= */ true, /* detach_mount_point= */ force);
-      !res.ok()) {
-    return res.error();
-  }
+  // We need a few ScopeGuards to recover the current state when something goes
+  // wrong. Note that std::vector destroys elements from the end.
+  std::vector<base::ScopeGuard<std::function<void()>>> guards;
 
-  // 3. Hard link to final destination.
-  std::string target_file =
-      StringPrintf("%s/%s.apex", gConfig->active_apex_data_dir, new_id.c_str());
-
-  auto guard = android::base::make_scope_guard([&]() {
-    if (unlink(target_file.c_str()) != 0 && errno != ENOENT) {
-      PLOG(ERROR) << "Failed to unlink " << target_file;
-    }
+  // 3. Unmount currently active APEX.
+  OR_RETURN(UnmountPackage(*cur_apex, /* allow_latest= */ true,
+                           /* deferred= */ true,
+                           /* detach_mount_point= */ force));
+  // Re-activate the current apex on error.
+  guards.emplace_back(base::make_scope_guard([&]() {
     // We can't really rely on the fact that dm-verity device backing up
     // previously active APEX is still around. We need to create a new one.
     std::string old_new_id = GetPackageId(temp_apex->GetManifest()) + "_" +
@@ -3707,45 +3735,93 @@ Result<ApexFile> InstallPackage(const std::string& package_path, bool force)
       // At this point not much we can do... :(
       LOG(ERROR) << res.error();
     }
-  });
+  }));
 
-  // At this point it should be safe to hard link |temp_apex| to
-  // |params->target_file|. In case reboot happens during one of the stages
-  // below, then on next boot apexd will pick up the new verified APEX.
-  if (link(package_path.c_str(), target_file.c_str()) != 0) {
-    return ErrnoError() << "Failed to link " << package_path << " to "
-                        << target_file;
+  // 4. Put the new file in "active" as |target_file|
+  std::string target_file;
+  if (IsMountBeforeDataEnabled()) {
+    auto image_manager = GetImageManager();
+    // Pin the new file first.
+    auto image = OR_RETURN(image_manager->PinApexFiles(Single(*temp_apex)))[0];
+    guards.emplace_back(base::make_scope_guard([=]() {
+      if (auto st = image_manager->DeleteImage(image); !st.ok()) {
+        LOG(ERROR) << st.error();
+      }
+    }));
+
+    // Update "active" list with the new image.
+    auto active_list =
+        OR_RETURN(image_manager->GetApexList(ApexListType::ACTIVE));
+    OR_RETURN(image_manager->UpdateApexList(
+        ApexListType::ACTIVE,
+        UpdateApexListWithNewEntries(
+            active_list, std::vector{ApexListEntry{image, module_name}})));
+    guards.emplace_back(base::make_scope_guard([=]() {
+      if (auto st =
+              image_manager->UpdateApexList(ApexListType::ACTIVE, active_list);
+          !st.ok()) {
+        LOG(ERROR) << st.error();
+      }
+    }));
+
+    // Map the image so that we can access the pinned APEX
+    target_file = OR_RETURN(image_manager->MapImage(image));
+    guards.emplace_back(base::make_scope_guard([=]() {
+      if (auto st = image_manager->UnmapImage(image); !st.ok()) {
+        LOG(ERROR) << st.error();
+      }
+    }));
+  } else {
+    // Hard-link to final destination
+    target_file = StringPrintf("%s/%s.apex", gConfig->active_apex_data_dir,
+                               new_id.c_str());
+    // At this point it should be safe to hard link |temp_apex| to
+    // |params->target_file|. In case reboot happens during one of the stages
+    // below, then on next boot apexd will pick up the new verified APEX.
+    if (link(package_path.c_str(), target_file.c_str()) != 0) {
+      return ErrnoError() << "Failed to link " << package_path << " to "
+                          << target_file;
+    }
+    // Remove the target file on error
+    guards.emplace_back(base::make_scope_guard([=]() {
+      if (unlink(target_file.c_str()) != 0 && errno != ENOENT) {
+        PLOG(ERROR) << "Failed to unlink " << target_file;
+      }
+    }));
   }
 
+  // Reopen ApexFile from the new location
   auto new_apex = ApexFile::Open(target_file);
   if (!new_apex.ok()) {
     return new_apex.error();
   }
 
-  // 4. And activate new one.
+  // 5. And activate new one.
   auto activate_status = ActivatePackageImpl(*new_apex, new_id,
                                              /* reuse_device= */ false);
   if (!activate_status.ok()) {
     return activate_status.error();
   }
 
-  // Accept the install.
-  guard.Disable();
+  // Accept the install. Disable all ScopeGuards.
+  for (auto& guard : guards) guard.Disable();
 
-  // 4. Now we can unlink old APEX if it's not pre-installed.
+  // 6. Now we can unlink old APEX if it's not pre-installed.
   if (!ApexFileRepository::GetInstance().IsPreInstalledApex(*cur_apex)) {
-    if (unlink(cur_mounted_data->full_path.c_str()) != 0) {
-      PLOG(ERROR) << "Failed to unlink " << cur_mounted_data->full_path;
+    if (auto image = GetImageManager()->FindPinnedApex(*cur_apex); image) {
+      if (auto st = GetImageManager()->UnmapAndDeleteImage(*image); !st.ok()) {
+        LOG(ERROR) << st.error();
+      }
+    } else {
+      if (unlink(cur_mounted_data->full_path.c_str()) != 0) {
+        PLOG(ERROR) << "Failed to unlink " << cur_mounted_data->full_path;
+      }
     }
   }
 
   if (auto res = EmitApexInfoList(/*is_bootstrap*/ false); !res.ok()) {
     LOG(ERROR) << res.error();
   }
-
-  // Release compressed blocks in case target_file is on f2fs-compressed
-  // filesystem.
-  ReleaseF2fsCompressedBlocks(target_file);
 
   event.MarkSucceeded();
 
