@@ -51,9 +51,9 @@ using android::apex::testing::ApexFileEq;
 using android::base::StringPrintf;
 using android::base::testing::Ok;
 using ::testing::_;
-using ::testing::ByRef;
 using ::testing::ContainerEq;
 using ::testing::Contains;
+using ::testing::Eq;
 using ::testing::IsEmpty;
 using ::testing::Not;
 using ::testing::Optional;
@@ -147,7 +147,7 @@ TEST(ApexFileRepositoryTest, AddPreInstalledApexParallel) {
   auto actual = instance.GetPreInstalledApexFiles();
   ASSERT_EQ(actual.size(), expected.size());
   for (size_t i = 0; i < actual.size(); ++i) {
-    ASSERT_THAT(actual[i], ApexFileEq(expected[i]));
+    ASSERT_THAT(actual[i], ApexFileEq(expected[i].get()));
   }
 }
 
@@ -190,7 +190,7 @@ TEST(ApexFileRepositoryTest, InitializeSameNameDifferentPathAborts) {
       "");
 }
 
-TEST(ApexFileRepositoryTest, InitializeMultiInstalledSuccess) {
+TEST(ApexFileRepositoryTest, ApexSelectWithMultiApexSuccess) {
   // Prepare test data.
   TemporaryDir td;
   std::string apex_file = GetTestFile("apex.apexd_test.apex");
@@ -201,13 +201,13 @@ TEST(ApexFileRepositoryTest, InitializeMultiInstalledSuccess) {
 
   std::string persist_prefix = "debug.apexd.test.persistprefix.";
   std::string bootconfig_prefix = "debug.apexd.test.bootconfigprefix.";
-  ApexFileRepository instance(/*enforce_multi_install_partition=*/false,
-                              /*multi_install_select_prop_prefixes=*/{
-                                  persist_prefix, bootconfig_prefix});
+  ApexFileRepository instance(
+      kApexDecompressedDir,
+      /*apex_select_prop_prefixes=*/{persist_prefix, bootconfig_prefix});
 
   auto test_fn = [&](const std::string& selected_filename) {
     ASSERT_RESULT_OK(
-        instance.AddPreInstalledApex({{ApexPartition::System, td.path}}));
+        instance.AddPreInstalledApex({{ApexPartition::Vendor, td.path}}));
     auto ret = instance.GetPreinstalledPath(apex->GetManifest().name());
     ASSERT_RESULT_OK(ret);
     ASSERT_EQ(StringPrintf("%s/%s", td.path, selected_filename.c_str()), *ret);
@@ -228,7 +228,36 @@ TEST(ApexFileRepositoryTest, InitializeMultiInstalledSuccess) {
   android::base::SetProperty(bootconfig_prefix + apex_name, "");
 }
 
-TEST(ApexFileRepositoryTest, InitializeMultiInstalledSkipsForDifferingKeys) {
+TEST(ApexFileRepositoryTest, IgnoreNoneForApexSelect) {
+  // Prepare test data.
+  TemporaryDir td;
+  fs::copy(GetTestFile("apex.apexd_test.apex"), td.path);
+  auto apex_name =
+      ApexFile::Open(GetTestFile("apex.apexd_test.apex"))->GetManifest().name();
+
+  auto apex_select_prop_prefix = "debug.apexd.select."s;
+
+  {
+    ApexFileRepository instance(
+        kApexDecompressedDir,
+        /*apex_select_prop_prefixes=*/{apex_select_prop_prefix});
+    ASSERT_THAT(
+        instance.AddPreInstalledApex({{ApexPartition::Vendor, td.path}}), Ok());
+    ASSERT_THAT(instance.GetPreInstalledApex(apex_name), Optional(_));
+  }
+  // With select prop is set to "none", the apex is skipped.
+  {
+    android::base::SetProperty(apex_select_prop_prefix + apex_name, "none");
+    ApexFileRepository instance(
+        kApexDecompressedDir,
+        /*apex_select_prop_prefixes=*/{apex_select_prop_prefix});
+    ASSERT_THAT(
+        instance.AddPreInstalledApex({{ApexPartition::Vendor, td.path}}), Ok());
+    ASSERT_THAT(instance.GetPreInstalledApex(apex_name), Eq(std::nullopt));
+  }
+}
+
+TEST(ApexFileRepositoryTest, ApexSelectSkipsForDifferingKeys) {
   // Prepare test data.
   TemporaryDir td;
   fs::copy(GetTestFile("apex.apexd_test.apex"),
@@ -241,11 +270,10 @@ TEST(ApexFileRepositoryTest, InitializeMultiInstalledSkipsForDifferingKeys) {
   std::string prop = prop_prefix + apex_name;
   android::base::SetProperty(prop, "version_a.apex");
 
-  ApexFileRepository instance(
-      /*enforce_multi_install_partition=*/false,
-      /*multi_install_select_prop_prefixes=*/{prop_prefix});
+  ApexFileRepository instance(kApexDecompressedDir,
+                              /*apex_select_prop_prefixes=*/{prop_prefix});
   ASSERT_RESULT_OK(
-      instance.AddPreInstalledApex({{ApexPartition::System, td.path}}));
+      instance.AddPreInstalledApex({{ApexPartition::Vendor, td.path}}));
   // Neither version should be have been installed.
   ASSERT_THAT(instance.GetPreinstalledPath(apex->GetManifest().name()),
               Not(Ok()));
@@ -253,7 +281,7 @@ TEST(ApexFileRepositoryTest, InitializeMultiInstalledSkipsForDifferingKeys) {
   android::base::SetProperty(prop, "");
 }
 
-TEST(ApexFileRepositoryTest, InitializeMultiInstalledSkipsForInvalidPartition) {
+TEST(ApexFileRepositoryTest, ApexSelectSkipsForInvalidPartition) {
   // Prepare test data.
   TemporaryDir td;
   // Note: These test files are on /data, which is not a valid partition for
@@ -268,9 +296,8 @@ TEST(ApexFileRepositoryTest, InitializeMultiInstalledSkipsForInvalidPartition) {
   std::string prop = prop_prefix + apex_name;
   android::base::SetProperty(prop, "version_a.apex");
 
-  ApexFileRepository instance(
-      /*enforce_multi_install_partition=*/true,
-      /*multi_install_select_prop_prefixes=*/{prop_prefix});
+  ApexFileRepository instance(kApexDecompressedDir,
+                              /*apex_select_prop_prefixes=*/{prop_prefix});
   ASSERT_RESULT_OK(
       instance.AddPreInstalledApex({{ApexPartition::System, td.path}}));
   // Neither version should be have been installed.
@@ -416,8 +443,7 @@ TEST(ApexFileRepositoryTest, AddAndGetDataApex) {
   auto data_apexs = ApexFileRepositoryAccessor::GetDataApexFiles(instance);
   auto normal_apex =
       ApexFile::Open(StringPrintf("%s/apex.apexd_test_v2.apex", data_dir.path));
-  ASSERT_THAT(data_apexs,
-              UnorderedElementsAre(ApexFileEq(ByRef(*normal_apex))));
+  ASSERT_THAT(data_apexs, UnorderedElementsAre(ApexFileEq(*normal_apex)));
 }
 
 TEST(ApexFileRepositoryTest, AddDataApexIgnoreCompressedApex) {
@@ -480,8 +506,7 @@ TEST(ApexFileRepositoryTest, AddDataApexPrioritizeHigherVersionApex) {
   auto data_apexs = ApexFileRepositoryAccessor::GetDataApexFiles(instance);
   auto normal_apex =
       ApexFile::Open(StringPrintf("%s/apex.apexd_test_v2.apex", data_dir.path));
-  ASSERT_THAT(data_apexs,
-              UnorderedElementsAre(ApexFileEq(ByRef(*normal_apex))));
+  ASSERT_THAT(data_apexs, UnorderedElementsAre(ApexFileEq(*normal_apex)));
 }
 
 TEST(ApexFileRepositoryTest, AddDataApexIgnoreIfLowerThanPreinstalled) {
@@ -545,9 +570,9 @@ TEST(ApexFileRepositoryTest, GetPreInstalledApexFiles) {
       StringPrintf("%s/apex.apexd_test.apex", built_in_dir.path));
   auto pre_apex_2 = ApexFile::Open(StringPrintf(
       "%s/com.android.apex.compressed.v1.capex", built_in_dir.path));
-  ASSERT_THAT(pre_installed_apexs,
-              UnorderedElementsAre(ApexFileEq(ByRef(*pre_apex_1)),
-                                   ApexFileEq(ByRef(*pre_apex_2))));
+  ASSERT_THAT(
+      pre_installed_apexs,
+      UnorderedElementsAre(ApexFileEq(*pre_apex_1), ApexFileEq(*pre_apex_2)));
 }
 
 TEST(ApexFileRepositoryTest, AllApexFilesByName) {
@@ -578,12 +603,11 @@ TEST(ApexFileRepositoryTest, AllApexFilesByName) {
 
   ASSERT_EQ(result.size(), 3u);
   ASSERT_THAT(result[apexd_test_file->GetManifest().name()],
-              UnorderedElementsAre(ApexFileEq(ByRef(*apexd_test_file))));
+              UnorderedElementsAre(ApexFileEq(*apexd_test_file)));
   ASSERT_THAT(result[shim_v1->GetManifest().name()],
-              UnorderedElementsAre(ApexFileEq(ByRef(*shim_v1)),
-                                   ApexFileEq(ByRef(*shim_v2))));
+              UnorderedElementsAre(ApexFileEq(*shim_v1), ApexFileEq(*shim_v2)));
   ASSERT_THAT(result[compressed_apex->GetManifest().name()],
-              UnorderedElementsAre(ApexFileEq(ByRef(*compressed_apex))));
+              UnorderedElementsAre(ApexFileEq(*compressed_apex)));
 }
 
 TEST(ApexFileRepositoryTest, GetPreInstalledApex) {
@@ -600,7 +624,7 @@ TEST(ApexFileRepositoryTest, GetPreInstalledApex) {
   ASSERT_RESULT_OK(apex);
 
   auto ret = instance.GetPreInstalledApex("com.android.apex.test_package");
-  ASSERT_THAT(ret, Optional(ApexFileEq(ByRef(*apex))));
+  ASSERT_THAT(ret, Optional(ApexFileEq(*apex)));
 }
 
 TEST(ApexFileRepositoryTest, GetPreInstalledApexNoSuchApex) {
@@ -679,7 +703,7 @@ TEST_F(ApexFileRepositoryTestAddBlockApex,
 
   // "block" apexes are treated as "pre-installed" with "is_factory: true"
   auto ret_foo = instance.GetPreInstalledApex("com.android.apex.test_package");
-  ASSERT_THAT(ret_foo, Optional(ApexFileEq(ByRef(*apex_foo))));
+  ASSERT_THAT(ret_foo, Optional(ApexFileEq(*apex_foo)));
 
   auto partition_foo = instance.GetPartition(*apex_foo);
   ASSERT_RESULT_OK(partition_foo);
@@ -689,7 +713,7 @@ TEST_F(ApexFileRepositoryTestAddBlockApex,
   ASSERT_RESULT_OK(apex_bar);
   auto ret_bar =
       instance.GetPreInstalledApex("com.android.apex.test_package_2");
-  ASSERT_THAT(ret_bar, Optional(ApexFileEq(ByRef(*apex_bar))));
+  ASSERT_THAT(ret_bar, Optional(ApexFileEq(*apex_bar)));
 
   auto partition_bar = instance.GetPartition(*apex_bar);
   ASSERT_EQ(*partition_bar, ApexPartition::System);
