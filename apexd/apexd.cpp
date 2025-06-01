@@ -92,6 +92,10 @@
 #include "apexd_vendor_apex.h"
 #include "apexd_verity.h"
 #include "com_android_apex.h"
+#include "com_android_apex_flags.h"
+
+namespace flags = com::android::apex::flags;
+namespace fs = std::filesystem;
 
 using android::base::boot_clock;
 using android::base::ConsumePrefix;
@@ -106,6 +110,7 @@ using android::base::SetProperty;
 using android::base::StartsWith;
 using android::base::StringPrintf;
 using android::base::unique_fd;
+using android::base::WriteStringToFile;
 using android::dm::DeviceMapper;
 using android::dm::DmDeviceState;
 using android::dm::DmTable;
@@ -362,6 +367,28 @@ Result<loop::LoopbackDeviceUniqueFd> CreateLoopForApex(const ApexFile& apex,
 
 bool IsMountBeforeDataEnabled() { return gConfig->mount_before_data; }
 
+[[maybe_unused]] bool CanMountBeforeDataOnNextBoot() {
+  // If there's no data apex files in /data/apex/active and no capex files, then
+  // apexd-bootstrap can mount ALL apexes (preinstalled and pinned data apexes).
+  if (!IsEmptyDirectory(gConfig->active_apex_data_dir)) {
+    return false;
+  }
+  auto& repo = ApexFileRepository::GetInstance();
+  if (std::ranges::any_of(
+          repo.GetPreInstalledApexFiles(),
+          [](const ApexFile& apex) { return apex.IsCompressed(); })) {
+    return false;
+  }
+  return true;
+}
+
+[[maybe_unused]] void CreateMetadataConfigFile(const std::string& filename) {
+  auto config_file = fs::path(gConfig->metadata_config_dir) / filename;
+  if (!WriteStringToFile("", config_file)) {
+    PLOG(ERROR) << "Failed to create " << config_file;
+  }
+}
+
 Result<DmDevice> CreateDmLinearForPayload(const ApexFile& apex,
                                           const std::string& device_name) {
   if (!apex.GetImageOffset() || !apex.GetImageSize()) {
@@ -487,8 +514,14 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
     Result<DmDevice> verity_dev_res =
         CreateDmDevice(device_name, *verity_table, reuse_device);
     if (!verity_dev_res.ok()) {
-      return Error() << "Failed to create Apex Verity device " << full_path
-                     << ": " << verity_dev_res.error();
+      // verify root digest for better debugging
+      if (auto st = VerifyVerityRootDigest(apex); !st.ok()) {
+        LOG(ERROR) << "Failed to verify root digest with " << full_path << ": "
+                   << st.error();
+      }
+      return Error() << "Failed to create dm-verity for path=" << full_path
+                     << " block=" << block_device << ": "
+                     << verity_dev_res.error();
     }
     verity_dev = std::move(*verity_dev_res);
     OR_RETURN(loop::ConfigureReadAhead(verity_dev.GetDevPath()));
@@ -2133,7 +2166,7 @@ int OnBootstrap() {
     ProcessSessions();
     auto data_apexes = ScanDataApexFiles(GetImageManager());
     instance.AddDataApexFiles(std::move(data_apexes));
-    activation_list = SelectApexForActivation();
+    activation_list = instance.SelectApexForActivation();
   } else {
     const auto& pre_installed_apexes = instance.GetPreInstalledApexFiles();
     size_t loop_device_cnt = pre_installed_apexes.size();
@@ -2218,76 +2251,6 @@ void Initialize(CheckpointInterface* checkpoint_service) {
 
   gMountedApexes.PopulateFromMounts(
       {gConfig->active_apex_data_dir, gConfig->decompression_dir});
-}
-
-/**
- * For every package X, there can be at most two APEX, pre-installed vs
- * installed on data. We usually select only one of these APEX for each
- * package based on the following conditions:
- *   - Package X must be pre-installed on one of the built-in directories.
- *   - If there are multiple APEX, we select the one with highest version.
- *   - If there are multiple with same version, we give priority to APEX on
- * /data partition.
- *
- * @return list of ApexFile that needs to be activated
- */
-std::vector<ApexFileRef> SelectApexForActivation() {
-  LOG(INFO) << "Selecting APEX for activation";
-  std::vector<ApexFileRef> activation_list;
-  const auto& instance = ApexFileRepository::GetInstance();
-  const auto& all_apex = instance.AllApexFilesByName();
-  activation_list.reserve(all_apex.size());
-  // For every package X, select which APEX to activate
-  for (auto& apex_it : all_apex) {
-    const std::string& package_name = apex_it.first;
-    const std::vector<ApexFileRef>& apex_files = apex_it.second;
-
-    if (apex_files.size() > 2 || apex_files.size() == 0) {
-      LOG(FATAL) << "Unexpectedly found more than two versions or none for "
-                    "APEX package "
-                 << package_name;
-      continue;
-    }
-
-    if (apex_files.size() == 1) {
-      LOG(DEBUG) << "Selecting the only APEX: " << package_name << " "
-                 << apex_files[0].get().GetPath();
-      activation_list.emplace_back(apex_files[0]);
-      continue;
-    }
-
-    // TODO(b/179497746): Now that we are dealing with list of reference, this
-    //  selection process can be simplified by sorting the vector.
-
-    // Given an APEX A and the version of the other APEX B, should we activate
-    // it?
-    auto select_apex = [&instance, &activation_list](
-                           const ApexFileRef& a_ref,
-                           const int version_b) mutable {
-      const ApexFile& a = a_ref.get();
-      // If A has higher version than B, then it should be activated
-      const bool higher_version = a.GetManifest().version() > version_b;
-      // If A has same version as B, then data version should get activated
-      const bool same_version_priority_to_data =
-          a.GetManifest().version() == version_b &&
-          !instance.IsPreInstalledApex(a);
-
-      bool activate = false;
-      if (higher_version || same_version_priority_to_data) {
-        LOG(DEBUG) << "Selecting between two APEX: " << a.GetManifest().name()
-                   << " " << a.GetPath();
-        activate = true;
-      }
-      if (activate) {
-        activation_list.emplace_back(a_ref);
-      }
-    };
-    const int version_0 = apex_files[0].get().GetManifest().version();
-    const int version_1 = apex_files[1].get().GetManifest().version();
-    select_apex(apex_files[0].get(), version_1);
-    select_apex(apex_files[1].get(), version_0);
-  }
-  return activation_list;
 }
 
 namespace {
@@ -2459,17 +2422,16 @@ void ActivateApexesOnStart() {
   // them to /data/apex/active first.
   ProcessSessions();
 
-  if (auto status = ApexFileRepository::GetInstance().AddDataApex(
-          gConfig->active_apex_data_dir);
+  auto& instance = ApexFileRepository::GetInstance();
+  if (auto status = instance.AddDataApex(gConfig->active_apex_data_dir);
       !status.ok()) {
     LOG(ERROR) << "Failed to collect data APEX files : " << status.error();
   }
 
   // Group every ApexFile on device by name
   ActivationContext ctx;
-  auto activation_list = SelectApexForActivation();
-  auto activate_status =
-      ActivateApexPackages(ctx, activation_list, ActivationMode::kBootMode);
+  auto activate_status = ActivateApexPackages(
+      ctx, instance.SelectApexForActivation(), ActivationMode::kBootMode);
   if (!activate_status.ok()) {
     std::string error_message = StringPrintf("Failed to activate packages: %s",
                                              activate_status.error().c_str());
@@ -2807,6 +2769,13 @@ void BootCompletedCleanup() REQUIRES(!gInstallLock) {
   gSessionManager->DeleteFinalizedSessions();
   RemoveInactiveDataApex();
   DeleteUnusedVerityDevices();
+
+  if constexpr (flags::mount_before_data()) {
+    // Mark "migration done" by creating /metadata/apex/config/mount_before_data
+    if (IsMountBeforeDataEnabled() || CanMountBeforeDataOnNextBoot()) {
+      CreateMetadataConfigFile("mount_before_data");
+    }
+  }
 }
 
 int UnmountAll(bool also_include_staged_apexes) {
@@ -3075,7 +3044,7 @@ int OnStartInVmMode() {
   }
 
   ActivationContext ctx;
-  auto result = ActivateApexPackages(ctx, SelectApexForActivation(),
+  auto result = ActivateApexPackages(ctx, instance.SelectApexForActivation(),
                                      ActivationMode::kVmMode);
   if (!result.ok()) {
     LOG(ERROR) << "Failed to activate apex packages : " << result.error();
@@ -3129,9 +3098,8 @@ int OnOtaChrootBootstrap(bool also_include_staged_apexes) {
   }
 
   ActivationContext ctx;
-  auto activation_list = SelectApexForActivation();
-  auto activate_status = ActivateApexPackages(ctx, activation_list,
-                                              ActivationMode::kOtaChrootMode);
+  auto activate_status = ActivateApexPackages(
+      ctx, instance.SelectApexForActivation(), ActivationMode::kOtaChrootMode);
   if (!activate_status.ok()) {
     LOG(ERROR) << "Failed to activate apex packages : "
                << activate_status.error();
