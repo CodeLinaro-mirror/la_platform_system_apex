@@ -198,6 +198,7 @@ class ApexdUnitTest : public ::testing::Test {
         ApexImageManager::Create(metadata_images_dir_, data_images_dir_);
     metadata_config_dir_ = StringPrintf("%s/metadata-config", td_.path);
     brand_new_config_dir_ = StringPrintf("%s/brand-new-config", td_.path);
+    checkpoint_file_ = StringPrintf("%s/checkpoint", td_.path);
 
     config_ = ApexdConfig{
         kTestApexdStatusSysprop,
@@ -210,6 +211,7 @@ class ApexdUnitTest : public ::testing::Test {
         kTestVmPayloadMetadataPartitionProp,
         kTestActiveApexSelinuxCtx,
         {{partition_, brand_new_config_dir_}}, /* brand_new_apex_config_dirs */
+        checkpoint_file_.c_str(),
         flags::mount_before_data(),
         false,
         metadata_config_dir_.c_str(),
@@ -380,10 +382,13 @@ class ApexdUnitTest : public ::testing::Test {
 
   std::string metadata_images_dir_;
   std::string data_images_dir_;
+
   std::unique_ptr<ApexImageManager> image_manager_;
 
   std::string metadata_config_dir_;
   std::string brand_new_config_dir_;
+
+  std::string checkpoint_file_;
 
   ApexdConfig config_;
 };
@@ -3826,6 +3831,8 @@ TEST_F(ApexActivationFailureTests, StagedSessionRevertsWhenInFsRollbackMode) {
   auto apex_session = CreateStagedSession("apex.apexd_test.apex", 123);
   ASSERT_RESULT_OK(apex_session);
   apex_session->UpdateStateAndCommit(SessionState::STAGED);
+  // Revert requires a backup
+  ASSERT_THAT(BackupActiveApexes(), Ok());
 
   OnStart();
 
@@ -4050,6 +4057,8 @@ TEST_F(ApexdUnitTest, RevertStoresCrashingNativeProcess) {
   ASSERT_THAT(apex_session, Ok());
   ASSERT_THAT(apex_session->UpdateStateAndCommit(SessionState::ACTIVATED),
               Ok());
+  // RevertActiveSessions() assumes BackupActiveApexes() is called.
+  ASSERT_THAT(BackupActiveApexes(), Ok());
 
   ASSERT_THAT(RevertActiveSessions("test_process", ""), Ok());
   apex_session = GetSessionManager()->GetSession(1543);
@@ -4270,23 +4279,22 @@ struct SpyMetrics : Metrics {
 };
 
 TEST_F(ApexdMountTest, SendEventOnSubmitStagedSession) {
-  if (IsMountBeforeDataEnabled()) GTEST_SKIP() << "mount_before_data enabled";
-
-  MockCheckpointInterface checkpoint_interface;
-  checkpoint_interface.SetSupportsCheckpoint(true);
-  InitializeVold(&checkpoint_interface);
-
-  InitMetrics(std::make_unique<SpyMetrics>());
-
+  // Prepare a vendor APEX.
   std::string preinstalled_apex =
       AddPreInstalledApex("com.android.apex.vendor.foo.apex");
-
-  // Test APEX is a "vendor" APEX. Preinstalled partition should be vendor.
   ASSERT_RESULT_OK(ApexFileRepository::GetInstance().AddPreInstalledApex(
       {{ApexPartition::Vendor, GetBuiltInDir()}}));
 
-  OnStart();
+  // Prepare /apex/apex-info-list.xml for checkvintf to run.
+  // Note that checkvintf result is used in assertions below.
+  auto apex = ApexFile::Open(preinstalled_apex);
+  ASSERT_THAT(apex, Ok());
+  EmitApexInfoList(std::vector{std::cref(*apex)}, /*is_bootstrap=*/false);
 
+  // Install SpyMetrics
+  InitMetrics(std::make_unique<SpyMetrics>());
+
+  // Call SubmitStagedSession with a new APEX with vintf_fragment
   PrepareStagedSession("com.android.apex.vendor.foo.with_vintf.apex", 239);
   ASSERT_RESULT_OK(SubmitStagedSession(239, {}, false, false, -1));
 
@@ -4730,6 +4738,12 @@ class MountBeforeDataTest : public ApexdMountTest {
     DeleteDirContent(staged_session_dir_);
     InitializeVold(nullptr);
   }
+
+  void StagePackage(const std::string& test_apex, int session_id) {
+    PrepareStagedSession(test_apex, session_id);
+    ASSERT_THAT(SubmitStagedSession(session_id, {}, false, false, -1), Ok());
+    ASSERT_THAT(MarkStagedSessionReady(session_id), Ok());
+  }
 };
 
 TEST_F(MountBeforeDataTest, ActivatePinnedApex) {
@@ -5069,6 +5083,30 @@ TEST_F(MountBeforeDataTest, UnstagePackages) {
   // Now v1 is activated.
   ASSERT_THAT(GetApexMounts(),
               Contains("/apex/com.android.apex.test_package@1"));
+}
+
+TEST_F(MountBeforeDataTest, AbortChangesOnActivationFailure) {
+  ASSERT_EQ(0, OnBootstrap());
+
+  // Set checkpointing
+  ASSERT_TRUE(base::WriteStringToFile("3", checkpoint_file_));
+
+  // Stage com.android.apex.test_package@2
+  auto session_id = 42;
+  StagePackage("apex.apexd_test_v2.apex", session_id);
+  SimulateReboot();
+
+  // Create a mount-point directory with a dummy file in it so that
+  // the activation fails.
+  ASSERT_THAT(mkdir("/apex/com.android.apex.test_package@2", 0755), Eq(0));
+  TouchFile("/apex/com.android.apex.test_package@2", "dummy");
+
+  // Note that failure is recovered by fallback to preinstalled.
+  ASSERT_THAT(OnBootstrap(), Eq(0));
+
+  std::string content;
+  ASSERT_TRUE(base::ReadFileToString(checkpoint_file_, &content));
+  ASSERT_EQ(content, "0");
 }
 
 class LogTestToLogcat : public ::testing::EmptyTestEventListener {

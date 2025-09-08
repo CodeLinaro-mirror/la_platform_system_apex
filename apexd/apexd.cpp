@@ -445,7 +445,7 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
   };
   auto scope_guard = android::base::make_scope_guard(deleter);
   if (!IsEmptyDirectory(mount_point)) {
-    return ErrnoError() << mount_point << " is not empty";
+    return Error() << mount_point << " is not empty";
   }
 
   const std::string& full_path = apex.GetPath();
@@ -1018,6 +1018,11 @@ Result<void> UnmountPackage(const ApexFile& apex, bool deferred,
 }  // namespace
 
 void SetConfig(const ApexdConfig& config) { gConfig = config; }
+
+const ApexdConfig& GetConfig() {
+  CHECK(gConfig.has_value()) << "Call SetConfig() first";
+  return *gConfig;
+}
 
 Result<void> MountPackage(const ApexFile& apex, const std::string& mount_point,
                           int32_t loop_id, const std::string& device_name,
@@ -2182,13 +2187,32 @@ Result<void> RevertActiveSessionsAndReboot(
     return status;
   }
   LOG(ERROR) << "Successfully reverted. Time to reboot device.";
-  if (gInFsCheckpointMode) {
-    Result<void> res = gVoldService->AbortChanges(
-        "apexd_initiated" /* message */, false /* retry */);
-    if (!res.ok()) {
-      LOG(ERROR) << res.error();
+
+  // Before reboot, need to abort the checkpoint mode if it is.
+
+  // In case `vold` service is available, use it.
+  if (gVoldService) {
+    // If the device is in FS checkpoint mode, let's abort it and reboot so that
+    // the device to be in "needsRollback" mode.
+    if (gInFsCheckpointMode) {
+      auto result = gVoldService->AbortChanges(/*message=*/"apexd_initiated",
+                                               /*retry=*/false);
+      if (!result.ok()) {
+        LOG(ERROR) << result.error();
+      }
+    }
+  } else if (IsMountBeforeDataEnabled()) {
+    // This is the case when apexd-bootstrap fails to activate new APEXes.
+    // Even if the filesystem supports checkpointing and the device is in the
+    // checkpoint mode, apexd-bootstrap can't delegate "abortChanges" to vold
+    // because vold hasn't started. apexd-bootstrap must therefore perform it
+    // on its own.
+    auto result = AbortChanges();
+    if (!result.ok()) {
+      LOG(ERROR) << "Failed to abort checkpoint: " << result.error();
     }
   }
+
   Reboot();
   return {};
 }
@@ -2697,11 +2721,11 @@ Result<std::vector<ApexFile>> SubmitStagedSession(
                    << " rollback and enabled for rollback.";
   }
 
-  if (IsMountBeforeDataEnabled()) {
-    OR_RETURN(GetImageManager()->BackupApexList());
-  } else if (!gSupportsFsCheckpoints) {
-    OR_RETURN(BackupActivePackages());
-  }
+  // Create a backup of the current ACTIVE APEXes or update the existing backup.
+  // This could be called just before applying staged sessions in
+  // ProcessSessions() but we want to put as much as possible in
+  // SubmitStagedSession() to avoid fail-and-recover during boot.
+  OR_RETURN(BackupActiveApexes());
 
   auto ret =
       OR_RETURN(OpenApexFilesInSessionDirs(session_id, child_session_ids));
@@ -3613,11 +3637,21 @@ void SaveChangedActiveApexes(
   }
 }
 
+Result<void> BackupActiveApexes() {
+  if (IsMountBeforeDataEnabled()) {
+    return GetImageManager()->BackupApexList();
+  } else if (!gSupportsFsCheckpoints) {
+    return BackupActivePackages();
+  } else {
+    return {};
+  }
+}
+
 ApexSessionManager* GetSessionManager() { return gSessionManager; }
 
 void RebootImpl() {
   LOG(INFO) << "Rebooting device";
-  if (android_reboot(ANDROID_RB_RESTART2, 0, nullptr) != 0) {
+  if (android_reboot(ANDROID_RB_RESTART2, 0, "apexd_initiated") != 0) {
     LOG(ERROR) << "Failed to reboot device";
   }
   // Wait for reboot to complete as we expect this to be a terminal
