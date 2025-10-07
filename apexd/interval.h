@@ -57,6 +57,12 @@ struct Interval {
   }
 };
 
+struct IntervalComparatorByLength {
+  bool operator()(const Interval &a, const Interval &b) {
+    return a.length != b.length ? a.length < b.length : a.offset < b.offset;
+  }
+};
+
 uint64_t IntervalsGetLength(const std::vector<Interval> &intervals);
 
 std::vector<Interval> SubtractIntervals(const std::vector<Interval> &list_a,
@@ -67,5 +73,8 @@ std::vector<Interval> NormalizeIntervals(std::vector<Interval> intervals);
 // (intervals, length) -> (intervals, intervals)
 std::pair<std::vector<Interval>, std::vector<Interval>> TakeLengthFromStart(
     const std::vector<Interval> &intervals, uint64_t length);
+
+std::vector<Interval> ApplyOffsetLength(const std::vector<Interval> &intervals,
+                                        uint32_t offset, size_t length);
 
 }  // namespace android::apex

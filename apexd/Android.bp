@@ -140,6 +140,7 @@ cc_binary {
         "libapexd_metrics_stats-deps",
     ],
     srcs: [
+        "apexd_dump.cpp",
         "apexd_main.cpp",
     ],
     static_libs: [
@@ -149,6 +150,7 @@ cc_binary {
         "libapexd",
         "libapexservice",
     ],
+    required: ["apexd-lsof.sh"],
     init_rc: ["apexd.rc"],
     // Just like the init, apexd should be able to run without
     // any APEX activated. To do so, it uses the bootstrap linker
@@ -774,4 +776,7 @@ aconfig_declarations {
 cc_aconfig_library {
     name: "libapexd_flags",
     aconfig_declarations: "apexd_flags",
+    mode: "force-read-only",
+    ramdisk_available: true,
+    recovery_available: true,
 }

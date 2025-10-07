@@ -42,6 +42,7 @@ namespace apex {
 // this config should do the trick.
 struct ApexdConfig {
   const char* apex_status_sysprop;
+  const char* apexd_changed_active_apexes_sysprop;
   std::unordered_map<ApexPartition, std::string> builtin_dirs;
   const char* active_apex_data_dir;
   const char* decompression_dir;
@@ -66,6 +67,7 @@ struct ApexdConfig {
 
 static const ApexdConfig kDefaultConfig = {
     kApexStatusSysprop,
+    kApexdChangedActiveApexesSysprop,
     kBuiltinApexPackageDirs,
     kActiveApexPackagesDataDir,
     kApexDecompressedDir,
@@ -152,6 +154,8 @@ void Initialize(CheckpointInterface* checkpoint_service);
 // "activated").
 void OnStart();
 
+int OnDump(const std::vector<std::string>& args);
+
 android::base::Result<ApexFile> ProcessCompressedApex(const ApexFile& capex,
                                                       bool is_ota_chroot);
 // Validate |apex| is same as |capex|
@@ -177,9 +181,8 @@ void RemoveInactiveDataApex();
 void BootCompletedCleanup();
 int SnapshotOrRestoreDeUserData();
 
-// Unmounts all apexes.
-// If `also_include_staged_apexes` is true, it's for Pre-reboot Dexopt.
-int UnmountAll(bool also_include_staged_apexes);
+// Unmounts all apex mounts from /proc/mounts
+int UnmountAll();
 
 // Exposed for unit tests
 bool ShouldAllocateSpaceForDecompression(const std::string& new_apex_name,
@@ -216,10 +219,12 @@ android::apex::MountedApexDatabase& GetApexDatabaseForTesting();
 android::base::Result<ApexFile> InstallPackage(const std::string& package_path,
                                                bool force);
 
-bool IsActiveApexChanged(const ApexFile& apex);
+std::set<std::string> GetChangedActiveApexes();
 
-// Shouldn't be used outside of apexd_test.cpp
-std::set<std::string>& GetChangedActiveApexesForTesting();
+// Supposed to be called only once in OnBootstrap() or OnStart() to set the
+// ro.apexd.changed_active_apexes property.
+void SaveChangedActiveApexes(
+    const std::set<std::string>& changed_active_apexes);
 
 ApexSessionManager* GetSessionManager();
 
