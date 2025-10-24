@@ -93,7 +93,6 @@
 #include "apexd_verity.h"
 #include "com_android_apex.h"
 #include "com_android_apex_flags.h"
-#include "interval.h"
 
 namespace flags = com::android::apex::flags;
 namespace fs = std::filesystem;
@@ -102,6 +101,7 @@ using android::base::boot_clock;
 using android::base::ConsumePrefix;
 using android::base::ErrnoError;
 using android::base::Error;
+using android::base::GetBoolProperty;
 using android::base::GetProperty;
 using android::base::Join;
 using android::base::ParseUint;
@@ -374,13 +374,6 @@ bool IsMountBeforeDataEnabled() { return gConfig->mount_before_data; }
   return true;
 }
 
-[[maybe_unused]] void CreateMetadataConfigFile(const std::string& filename) {
-  auto config_file = fs::path(gConfig->metadata_config_dir) / filename;
-  if (!WriteStringToFile("", config_file)) {
-    PLOG(ERROR) << "Failed to create " << config_file;
-  }
-}
-
 Result<DmDevice> CreateDmLinearForPayload(const ApexFile& apex) {
   if (!apex.GetImageOffset() || !apex.GetImageSize()) {
     return Error() << "Cannot create mount point without image offset and size";
@@ -452,7 +445,7 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
   };
   auto scope_guard = android::base::make_scope_guard(deleter);
   if (!IsEmptyDirectory(mount_point)) {
-    return ErrnoError() << mount_point << " is not empty";
+    return Error() << mount_point << " is not empty";
   }
 
   const std::string& full_path = apex.GetPath();
@@ -573,6 +566,38 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
   LOG(VERBOSE) << "Successfully mounted package " << full_path << " on "
                << mount_point << " duration=" << time_elapsed;
   return apex_data;
+}
+
+// Run test hook commands specified by the sysprop for testing.
+//
+// The sysprop value may have a list of commands separated by |.
+// Available commands are
+// - sleep_ms <ms>: sleep(ms)
+// - error <message>: return Error()
+Result<void> RunTestHookCommands(const std::string& sysprop) {
+  auto hook_commands = GetProperty(sysprop, "");
+  if (!hook_commands.empty()) {
+    // Clear the sysprop so that the command runs only once
+    SetProperty(sysprop, "");
+
+    for (auto command : base::Split(hook_commands, "|")) {
+      if (command.empty()) {
+        continue;
+      }
+      LOG(INFO) << "Running " << command;
+      auto args = base::Split(command, " ");
+      uint32_t num = 0;
+      if (args[0] == "sleep_ms" && args.size() == 2 &&
+          ParseUint(args[1], &num)) {
+        usleep(num * 1000);
+      } else if (args[0] == "error" && args.size() == 2) {
+        return Error() << args[1];
+      } else {
+        LOG(ERROR) << "Invalid command: " << command;
+      }
+    }
+  }
+  return {};
 }
 
 }  // namespace
@@ -993,6 +1018,11 @@ Result<void> UnmountPackage(const ApexFile& apex, bool deferred,
 }  // namespace
 
 void SetConfig(const ApexdConfig& config) { gConfig = config; }
+
+const ApexdConfig& GetConfig() {
+  CHECK(gConfig.has_value()) << "Call SetConfig() first";
+  return *gConfig;
+}
 
 Result<void> MountPackage(const ApexFile& apex, const std::string& mount_point,
                           int32_t loop_id, const std::string& device_name,
@@ -1724,7 +1754,7 @@ void RestorePreRestoreSnapshotsIfPresent(const std::string& base_dir,
   auto pre_restore_snapshot_path =
       StringPrintf("%s/%s/%d%s", base_dir.c_str(), kApexSnapshotSubDir,
                    session.GetRollbackId(), kPreRestoreSuffix);
-  if (PathExists(pre_restore_snapshot_path).ok()) {
+  if (auto st = PathExists(pre_restore_snapshot_path); st.ok() && st.value()) {
     for (const auto& apex_name : session.GetApexNames()) {
       Result<void> result = RestoreDataDirectory(
           base_dir, session.GetRollbackId(), apex_name, true /* pre_restore */);
@@ -1743,6 +1773,7 @@ void RestoreDePreRestoreSnapshotsIfPresent(const ApexSession& session) {
   if (!user_dirs.ok()) {
     LOG(ERROR) << "Error reading user dirs to restore pre-restore snapshots"
                << user_dirs.error();
+    return;
   }
 
   for (const auto& user_dir : *user_dirs) {
@@ -1768,6 +1799,7 @@ void DeleteDePreRestoreSnapshots(const ApexSession& session) {
   if (!user_dirs.ok()) {
     LOG(ERROR) << "Error reading user dirs to delete pre-restore snapshots"
                << user_dirs.error();
+    return;
   }
 
   for (const auto& user_dir : *user_dirs) {
@@ -2051,11 +2083,34 @@ Result<void> UnstagePackages(const std::vector<std::string>& paths) {
   return {};
 }
 
+void MarkSessions(std::vector<ApexSession>& sessions,
+                  SessionState::State state) {
+  for (auto& session : sessions) {
+    auto st = session.UpdateStateAndCommit(state);
+    LOG(DEBUG) << "Marking " << session << " as "
+               << SessionState_State_Name(state);
+    if (!st.ok()) {
+      LOG(WARNING) << "Failed to mark session " << session << " as "
+                   << SessionState_State_Name(state) << ": " << st.error();
+    }
+  }
+}
+
 /**
  * During apex installation, staged sessions located in
- * /metadata/apex/sessions mutate the active sessions in /data/apex/active. If
- * some error occurs during installation of apex, we need to revert
- * /data/apex/active to its original state and reboot.
+ * /metadata/apex/sessions mutate the active set of APEXes. If some error occurs
+ * during installation, we need to revert the active set of APEXes to its
+ * original state and reboot.
+ *
+ * For example, if the active set of APEXes are kept in /data/apex/active, the
+ * directory should be backed up on staging, and restored here. In case FS
+ * checkpointing is supported, the backup/restore can be skipped because
+ * reboot will restore the /data partition to the original state.
+ *
+ * With mount_before_data, the /data partition is not changed during
+ * installation. Instead, the list of active APEXes is kept in /metadata/apex.
+ * The list should be backed up on staging, and restored here. FS checkpointing
+ * doesn't matter.
  *
  * Also, we need to put staged sessions in /metadata/apex/sessions in
  * REVERTED state so that they do not get activated on next reboot.
@@ -2077,6 +2132,9 @@ Result<void> RevertActiveSessions(const std::string& crashing_native_process,
     return Error() << "Revert requested, when there are no active sessions.";
   }
 
+  // Before proceeding the actual revert, let's mark active sessions as
+  // REVERT_IN_PROGRESS so that even if the revert fails we can resume revert
+  // on next reboot and avoid reapplying the active sessions.
   for (auto& session : active_sessions) {
     if (!crashing_native_process.empty()) {
       session.SetCrashingNativeProcess(crashing_native_process);
@@ -2092,22 +2150,37 @@ Result<void> RevertActiveSessions(const std::string& crashing_native_process,
     }
   }
 
-  if (!gSupportsFsCheckpoints) {
-    auto restore_status = RestoreActivePackages();
-    if (!restore_status.ok()) {
-      for (auto& session : active_sessions) {
-        auto st = session.UpdateStateAndCommit(SessionState::REVERT_FAILED);
-        LOG(DEBUG) << "Marking " << session << " as failed to revert";
-        if (!st.ok()) {
-          LOG(WARNING) << "Failed to mark session " << session
-                       << " as failed to revert : " << st.error();
-        }
-      }
-      return restore_status;
+  // Revert the active set of APEXes now!
+
+  if (IsMountBeforeDataEnabled()) {
+    auto st = GetImageManager()->RestoreApexList();
+    if (!st.ok()) {
+      MarkSessions(active_sessions, SessionState::REVERT_FAILED);
+      return st;
+    }
+  } else if (!gSupportsFsCheckpoints) {
+    auto st = RestoreActivePackages();
+    if (!st.ok()) {
+      MarkSessions(active_sessions, SessionState::REVERT_FAILED);
+      return st;
     }
   } else {
     LOG(INFO) << "Not restoring active packages in checkpoint mode.";
   }
+
+  // Installing a rollback means restoring the apexdata (DE_sys/DE_n) as well.
+  // In case of reverting a rollback, the restored apexdata should be reverted.
+  // This is done automatically for devices with FS checkpointing. Otherwise,
+  // the apexdata should be manually snapshotted (aka, pre-restore snapshot),
+  // and restored when reverting.
+  //
+  // In case of mount-before-data, RevertActiveSessions() can be invoked in
+  // either apexd-bootstrap (before /data) or apexd (after /data). apexd works
+  // fine for both cases: When it's called in apexd-bootstrap, the apexdata is
+  // not restored yet, hence nothing to revert. When it's called in apexd, it
+  // works just as expected. Btw, RestoreDePreRestoreSnapshotsIfPresent() will
+  // emit some error messages (with no harm) when it's called during
+  // apexd-bootstrap because there's no /data yet.
 
   for (auto& session : active_sessions) {
     if (!gSupportsFsCheckpoints && session.IsRollback()) {
@@ -2115,13 +2188,9 @@ Result<void> RevertActiveSessions(const std::string& crashing_native_process,
       // pre-restore snapshot.
       RestoreDePreRestoreSnapshotsIfPresent(session);
     }
-
-    auto status = session.UpdateStateAndCommit(SessionState::REVERTED);
-    if (!status.ok()) {
-      LOG(WARNING) << "Failed to mark session " << session
-                   << " as reverted : " << status.error();
-    }
   }
+
+  MarkSessions(active_sessions, SessionState::REVERTED);
 
   return {};
 }
@@ -2134,13 +2203,32 @@ Result<void> RevertActiveSessionsAndReboot(
     return status;
   }
   LOG(ERROR) << "Successfully reverted. Time to reboot device.";
-  if (gInFsCheckpointMode) {
-    Result<void> res = gVoldService->AbortChanges(
-        "apexd_initiated" /* message */, false /* retry */);
-    if (!res.ok()) {
-      LOG(ERROR) << res.error();
+
+  // Before reboot, need to abort the checkpoint mode if it is.
+
+  // In case `vold` service is available, use it.
+  if (gVoldService) {
+    // If the device is in FS checkpoint mode, let's abort it and reboot so that
+    // the device to be in "needsRollback" mode.
+    if (gInFsCheckpointMode) {
+      auto result = gVoldService->AbortChanges(/*message=*/"apexd_initiated",
+                                               /*retry=*/false);
+      if (!result.ok()) {
+        LOG(ERROR) << result.error();
+      }
+    }
+  } else if (IsMountBeforeDataEnabled()) {
+    // This is the case when apexd-bootstrap fails to activate new APEXes.
+    // Even if the filesystem supports checkpointing and the device is in the
+    // checkpoint mode, apexd-bootstrap can't delegate "abortChanges" to vold
+    // because vold hasn't started. apexd-bootstrap must therefore perform it
+    // on its own.
+    auto result = AbortChanges();
+    if (!result.ok()) {
+      LOG(ERROR) << "Failed to abort checkpoint: " << result.error();
     }
   }
+
   Reboot();
   return {};
 }
@@ -2558,7 +2646,8 @@ void OnStart() {
     // the device never goes back to the migration state even if OnStart() fails
     // to complete.
     if (IsMountBeforeDataEnabled()) {
-      CreateMetadataConfigFile("mount_before_data");
+      android::apex::TouchFile(gConfig->metadata_config_dir,
+                               "mount_before_data");
     }
   }
 
@@ -2574,7 +2663,15 @@ void OnStart() {
       LOG(INFO) << "Exceeded number of session retries ("
                 << kNumRetriesWhenCheckpointingEnabled
                 << "). Starting a revert";
-      RevertActiveSessions("", "");
+      if (auto st = RevertActiveSessions("", ""); st.ok()) {
+        // After reverting the active sessions and restoring the active APEXes,
+        // need to reboot to activate the restored active APEXes.
+        if (IsMountBeforeDataEnabled()) {
+          Reboot();
+        }
+      } else {
+        LOG(ERROR) << "Revert failed: " << st.error();
+      }
     }
   }
 
@@ -2640,13 +2737,11 @@ Result<std::vector<ApexFile>> SubmitStagedSession(
                    << " rollback and enabled for rollback.";
   }
 
-  if (!gSupportsFsCheckpoints) {
-    Result<void> backup_status = BackupActivePackages();
-    if (!backup_status.ok()) {
-      // Do not proceed with staged install without backup
-      return backup_status.error();
-    }
-  }
+  // Create a backup of the current ACTIVE APEXes or update the existing backup.
+  // This could be called just before applying staged sessions in
+  // ProcessSessions() but we want to put as much as possible in
+  // SubmitStagedSession() to avoid fail-and-recover during boot.
+  OR_RETURN(BackupActiveApexes());
 
   auto ret =
       OR_RETURN(OpenApexFilesInSessionDirs(session_id, child_session_ids));
@@ -2658,6 +2753,12 @@ Result<std::vector<ApexFile>> SubmitStagedSession(
   std::vector<std::string> apex_images;
   if (IsMountBeforeDataEnabled()) {
     apex_images = OR_RETURN(GetImageManager()->PinApexFiles(ret));
+  }
+
+  // Run test commands only when installing Shim APEX on a debuggable device.
+  if (GetBoolProperty("ro.debuggable", false) &&
+      std::ranges::any_of(ret, &shim::IsShimApex)) {
+    OR_RETURN(RunTestHookCommands("apexd.test_hook.submit_staged_session"));
   }
 
   // The incoming session is now verified by apexd. From now on, apexd keeps
@@ -2874,7 +2975,8 @@ void BootCompletedCleanup() REQUIRES(!gInstallLock) {
   if constexpr (flags::mount_before_data()) {
     // Mark "migration done" by creating /metadata/apex/config/mount_before_data
     if (IsMountBeforeDataEnabled() || CanMountBeforeDataOnNextBoot()) {
-      CreateMetadataConfigFile("mount_before_data");
+      android::apex::TouchFile(gConfig->metadata_config_dir,
+                               "mount_before_data");
     }
   }
 }
@@ -3551,7 +3653,32 @@ void SaveChangedActiveApexes(
   }
 }
 
+Result<void> BackupActiveApexes() {
+  if (IsMountBeforeDataEnabled()) {
+    return GetImageManager()->BackupApexList();
+  } else if (!gSupportsFsCheckpoints) {
+    return BackupActivePackages();
+  } else {
+    return {};
+  }
+}
+
 ApexSessionManager* GetSessionManager() { return gSessionManager; }
+
+void RebootImpl() {
+  LOG(INFO) << "Rebooting device";
+  if (android_reboot(ANDROID_RB_RESTART2, 0, "apexd_initiated") != 0) {
+    LOG(ERROR) << "Failed to reboot device";
+  }
+  // Wait for reboot to complete as we expect this to be a terminal
+  // command. Crash apexd if reboot does not complete even after
+  // waiting an arbitrary significant amount of time.
+  std::this_thread::sleep_for(std::chrono::seconds(120));
+  LOG(FATAL) << "Device did not reboot within 120 seconds";
+}
+
+// Use the real implementation by default. Unit tests need to override it.
+void (*Reboot)() = &RebootImpl;
 
 }  // namespace apex
 }  // namespace android
