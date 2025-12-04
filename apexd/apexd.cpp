@@ -359,6 +359,8 @@ Result<loop::LoopbackDeviceUniqueFd> CreateLoopForApex(const ApexFile& apex,
 
 bool IsMountBeforeDataEnabled() { return gConfig->mount_before_data; }
 
+bool UsesPinnedApex() { return gConfig->uses_pinned_apex; }
+
 [[maybe_unused]] bool CanMountBeforeDataOnNextBoot() {
   // If there's no data apex files in /data/apex/active and no capex files, then
   // apexd-bootstrap can mount ALL apexes (preinstalled and pinned data apexes).
@@ -456,7 +458,7 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
   loop::LoopbackDeviceUniqueFd loop;
   DmDevice linear_dev;
 
-  if (IsMountBeforeDataEnabled() && GetImageManager()->IsPinnedApex(apex)) {
+  if (UsesPinnedApex() && GetImageManager()->IsPinnedApex(apex)) {
     linear_dev = OR_RETURN(CreateDmLinearForPayload(apex));
     block_device = linear_dev.GetDevPath();
   } else {
@@ -847,6 +849,9 @@ Result<VerificationResult> VerifyPackagesStagedInstall(
 }
 
 Result<void> DeleteBackup() {
+  if (UsesPinnedApex()) {
+    return GetImageManager()->UpdateApexList(ApexListType::BACKUP, {});
+  }
   auto exists = PathExists(std::string(kApexBackupDir));
   if (!exists.ok()) {
     return Error() << "Can't clean " << kApexBackupDir << " : "
@@ -961,6 +966,10 @@ Result<void> RestoreActivePackages() {
   return {};
 }
 
+}  // namespace
+
+namespace apexd_private {
+
 Result<void> UnmountPackage(const ApexFile& apex, bool deferred,
                             bool detach_mount_point) {
   LOG(INFO) << "Unmounting " << GetPackageId(apex.GetManifest())
@@ -1015,7 +1024,7 @@ Result<void> UnmountPackage(const ApexFile& apex, bool deferred,
   return Unmount(*data, deferred);
 }
 
-}  // namespace
+}  // namespace apexd_private
 
 void SetConfig(const ApexdConfig& config) { gConfig = config; }
 
@@ -1196,8 +1205,9 @@ Result<void> DeactivatePackage(const std::string& full_path) {
     return apex_file.error();
   }
 
-  return UnmountPackage(*apex_file,
-                        /*deferred=*/false, /*detach_mount_point=*/false);
+  return apexd_private::UnmountPackage(*apex_file,
+                                       /*deferred=*/false,
+                                       /*detach_mount_point=*/false);
 }
 
 Result<std::vector<std::string>> ScanApexFilesInSessionDirs(
@@ -1371,7 +1381,7 @@ Result<void> AbortStagedSession(int session_id) REQUIRES(!gInstallLock) {
     case SessionState::VERIFIED:
       [[fallthrough]];
     case SessionState::STAGED:
-      if (IsMountBeforeDataEnabled()) {
+      if (UsesPinnedApex()) {
         for (const auto& image : session->GetApexImages()) {
           auto result = GetImageManager()->DeleteImage(image);
           if (!result.ok()) {
@@ -1821,7 +1831,7 @@ Result<std::vector<std::string>> TryActivateStagedSession(
            << "Cannot install apex session if not in fs-checkpoint mode";
   }
 
-  if (IsMountBeforeDataEnabled()) {
+  if (UsesPinnedApex()) {
     if (session.GetApexImages().empty()) {
       return Error() << "No apex found in session";
     }
@@ -1862,6 +1872,14 @@ Result<std::vector<std::string>> TryActivateStagedSession(
     // Let's keep mapped devices because they needs to be mapped as "active" in
     // ScanDataApexFiles().
     unmap_devices.Disable();
+
+    // Remove the previously active APEXes in /data/apex/active even when
+    // APEXes are installed using ApexImageManager. This can happen for OTA
+    // upgraded devices.
+    if (!IsMountBeforeDataEnabled()) {
+      OR_RETURN(RemovePreviouslyActiveApexFiles(apex_names_in_session, {}));
+    }
+
     return apex_names_in_session;
   } else {
     auto apexes = OR_RETURN(ScanSessionApexFiles(session));
@@ -2038,7 +2056,9 @@ Result<void> UnstagePackages(const std::vector<std::string>& paths) {
   }
   LOG(DEBUG) << "UnstagePackages() for " << Join(paths, ',');
 
-  std::vector<ApexFile> apex_files;
+  auto image_manager = GetImageManager();
+  std::vector<ApexFile> pinned_apexes;
+  std::vector<std::string> data_apexes;
   // Ensure the input paths are APEX files, but not pre-installed.
   for (const std::string& path : paths) {
     auto apex = ApexFile::Open(path);
@@ -2048,20 +2068,23 @@ Result<void> UnstagePackages(const std::vector<std::string>& paths) {
     if (ApexFileRepository::GetInstance().IsPreInstalledApex(*apex)) {
       return Error() << "Can't uninstall pre-installed apex " << path;
     }
-    apex_files.emplace_back(std::move(*apex));
+    if (UsesPinnedApex() && image_manager->IsPinnedApex(*apex)) {
+      pinned_apexes.emplace_back(std::move(*apex));
+    } else {
+      data_apexes.emplace_back(path);
+    }
   }
 
   // For now, UnstagePackages() is only for tests and callers should call
   // reboot() immediately.
   // TODO(b/384040968) Implement a proper "uninstall". Until then, we just
   // unlink/remove the input APEX paths.
-  if (IsMountBeforeDataEnabled()) {
+  if (UsesPinnedApex() && !pinned_apexes.empty()) {
     // Removing image names from the ACTIVE list is enough. After reboot, the
     // actual images will be removed as part of boot-completion cleanup.
-    auto image_manager = GetImageManager();
     auto active_list =
         OR_RETURN(image_manager->GetApexList(ApexListType::ACTIVE));
-    for (const auto& apex_file : apex_files) {
+    for (const auto& apex_file : pinned_apexes) {
       auto image = image_manager->FindPinnedApex(apex_file);
       if (!image) {
         return Error() << "Can't uninstall: image not found: "
@@ -2072,8 +2095,10 @@ Result<void> UnstagePackages(const std::vector<std::string>& paths) {
       });
     }
     OR_RETURN(image_manager->UpdateApexList(ApexListType::ACTIVE, active_list));
-  } else {
-    for (const std::string& path : paths) {
+  }
+
+  if (!data_apexes.empty()) {
+    for (const std::string& path : data_apexes) {
       if (unlink(path.c_str()) != 0) {
         return ErrnoError() << "Can't unlink " << path;
       }
@@ -2152,7 +2177,7 @@ Result<void> RevertActiveSessions(const std::string& crashing_native_process,
 
   // Revert the active set of APEXes now!
 
-  if (IsMountBeforeDataEnabled()) {
+  if (UsesPinnedApex()) {
     auto st = GetImageManager()->RestoreApexList();
     if (!st.ok()) {
       MarkSessions(active_sessions, SessionState::REVERT_FAILED);
@@ -2281,7 +2306,6 @@ void ProcessSessions(ActivationContext& ctx) {
 }
 
 std::vector<ApexFile> ScanDataApexFiles(ApexImageManager* manager) {
-  CHECK(IsMountBeforeDataEnabled());
   auto image_list = manager->GetApexList(ApexListType::ACTIVE);
   if (!image_list.ok()) {
     LOG(ERROR) << "Failed to get active image list : " << image_list.error();
@@ -2620,6 +2644,11 @@ void ActivateApexesOnStart() {
   // them to /data/apex/active first.
   ProcessSessions(ctx);
 
+  if (UsesPinnedApex()) {
+    auto data_apexes = ScanDataApexFiles(GetImageManager());
+    ApexFileRepository::GetInstance().AddDataApexFiles(std::move(data_apexes));
+  }
+
   auto& instance = ApexFileRepository::GetInstance();
   if (auto status = instance.AddDataApex(gConfig->active_apex_data_dir);
       !status.ok()) {
@@ -2751,7 +2780,7 @@ Result<std::vector<ApexFile>> SubmitStagedSession(
   event.AddHals(result.apex_hals);
 
   std::vector<std::string> apex_images;
-  if (IsMountBeforeDataEnabled()) {
+  if (UsesPinnedApex()) {
     apex_images = OR_RETURN(GetImageManager()->PinApexFiles(ret));
   }
 
@@ -2934,6 +2963,14 @@ void RemoveInactiveDataApex() {
                  << st.error();
     }
   }
+
+  // Finally, remove unreferenced pinned images (leaks).
+  if (UsesPinnedApex()) {
+    if (auto st = image_manager->RemoveUnreferencedImages(); !st.ok()) {
+      LOG(ERROR) << "Failed to remove unreferenced pinned APEX images: "
+                 << st.error();
+    }
+  }
 }
 
 bool IsApexDevice(const std::string& dev_name) {
@@ -2974,7 +3011,7 @@ void BootCompletedCleanup() REQUIRES(!gInstallLock) {
 
   if constexpr (flags::mount_before_data()) {
     // Mark "migration done" by creating /metadata/apex/config/mount_before_data
-    if (IsMountBeforeDataEnabled() || CanMountBeforeDataOnNextBoot()) {
+    if (CanMountBeforeDataOnNextBoot()) {
       android::apex::TouchFile(gConfig->metadata_config_dir,
                                "mount_before_data");
     }
@@ -3277,7 +3314,7 @@ int OnOtaChrootBootstrap(bool also_include_staged_apexes) {
     }
   }
 
-  if constexpr (flags::mount_before_data()) {
+  if (UsesPinnedApex()) {
     auto data_apexes = ScanDataApexFiles(GetImageManager());
     instance.AddDataApexFiles(std::move(data_apexes));
   }
@@ -3517,9 +3554,9 @@ Result<ApexFile> InstallPackage(const std::string& package_path, bool force)
   std::vector<base::ScopeGuard<std::function<void()>>> guards;
 
   // 3. Unmount currently active APEX.
-  OR_RETURN(UnmountPackage(*cur_apex,
-                           /*deferred=*/true,
-                           /*detach_mount_point=*/force));
+  OR_RETURN(apexd_private::UnmountPackage(*cur_apex,
+                                          /*deferred=*/true,
+                                          /*detach_mount_point=*/force));
   // Re-activate the current apex on error.
   guards.emplace_back(base::make_scope_guard([&]() {
     // We can't really rely on the fact that dm-verity device backing up
@@ -3536,7 +3573,7 @@ Result<ApexFile> InstallPackage(const std::string& package_path, bool force)
 
   // 4. Put the new file in "active" as |target_file|
   std::string target_file;
-  if (IsMountBeforeDataEnabled()) {
+  if (UsesPinnedApex()) {
     auto image_manager = GetImageManager();
     // Pin the new file first.
     auto image = OR_RETURN(image_manager->PinApexFiles(Single(*temp_apex)))[0];
@@ -3654,7 +3691,7 @@ void SaveChangedActiveApexes(
 }
 
 Result<void> BackupActiveApexes() {
-  if (IsMountBeforeDataEnabled()) {
+  if (UsesPinnedApex()) {
     return GetImageManager()->BackupApexList();
   } else if (!gSupportsFsCheckpoints) {
     return BackupActivePackages();
