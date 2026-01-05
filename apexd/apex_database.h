@@ -31,6 +31,21 @@
 namespace android {
 namespace apex {
 
+// The struct MountInfo represents a single entry from /proc/mounts.
+// For example, a line like
+// /dev/block/loop12 /apex/com.android.foo@1234 erofs ro,dirsync 0 0
+// will be parsed into
+// device: "/dev/block/loop12"
+// mount_point: "/apex/com.android.foo@1234"
+// fs: "erofs"
+// mount_options: "ro,dirsync"
+struct MountInfo {
+  std::filesystem::path device;
+  std::filesystem::path mount_point;
+  std::string fs;
+  std::string mount_options;
+};
+
 class MountedApexDatabase {
  public:
   // Stores associated low-level data for a mounted APEX. To conserve memory,
@@ -167,8 +182,6 @@ class MountedApexDatabase {
   // Note: using std::maps to
   //         a) so we do not have to worry about iterator invalidation.
   //         b) do not have to const_cast (over std::set)
-  // TODO(b/158467745): This structure (and functions) need to be guarded by
-  //   locks.
   std::map<std::string, std::set<MountedApexData>> mounted_apexes_
       GUARDED_BY(mounted_apexes_mutex_);
 
@@ -180,6 +193,11 @@ class MountedApexDatabase {
   };
   mutable Mutex mounted_apexes_mutex_;
 };
+
+std::optional<MountInfo> ParseMountInfo(const std::string& mount_info);
+
+android::base::Result<MountedApexDatabase::MountedApexData> ResolveMountInfo(
+    const MountInfo& mount_info);
 
 }  // namespace apex
 }  // namespace android
