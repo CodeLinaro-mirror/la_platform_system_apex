@@ -107,4 +107,12 @@ Result<void> DeleteDmDevice(const std::string& name, bool deferred) {
   return {};
 }
 
+std::optional<DmDevice> GetDmDeviceByName(const std::string& name) {
+  auto info = DeviceMapper::Instance().GetDetailedInfo(name);
+  if (!info) {
+    return std::nullopt;
+  }
+  return DmDevice{name, info->GetPath()};
+}
+
 }  // namespace android::apex
