@@ -30,6 +30,7 @@
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
+#include <sys/utsname.h>
 #include <sys/wait.h>
 
 #include <chrono>
@@ -300,29 +301,6 @@ inline android::base::Result<uintmax_t> GetFileSize(
   return value;
 }
 
-// Returns the number of seconds since the epoch.
-inline android::base::Result<int64_t> GetLastModifiedTime(
-    const std::string& path) {
-  struct stat st_buf;
-  if (stat(path.c_str(), &st_buf) != 0) {
-    return android::base::ErrnoError() << "Failed to stat " << path;
-  }
-  return st_buf.st_mtime;
-}
-
-inline android::base::Result<void> SetLastModifiedTime(const std::string& path,
-                                                       int64_t mtime) {
-  struct timeval times[2];
-  times[0].tv_sec = mtime;
-  times[0].tv_usec = 0;
-  times[1].tv_sec = mtime;
-  times[1].tv_usec = 0;
-  if (utimes(path.c_str(), times) != 0) {
-    return android::base::ErrnoError() << "Failed to set mtime for " << path;
-  }
-  return {};
-}
-
 inline android::base::Result<void> RestoreconPath(const std::string& path) {
   unsigned int seflags = SELINUX_ANDROID_RESTORECON_RECURSE;
   if (selinux_android_restorecon(path.c_str(), seflags) < 0) {
@@ -342,12 +320,69 @@ inline android::base::Result<std::string> GetfileconPath(
   return ret;
 }
 
+// Log information about DAC/MAC for a given path
+inline void LogPermissionInfo(const std::string& path) {
+  if (struct stat sb; stat(path.c_str(), &sb) == 0) {
+    LOG(ERROR) << path << ": stat="
+               << std::format("{:04o}/{}/{}", sb.st_mode & 0777, sb.st_uid,
+                              sb.st_gid);
+  } else {
+    PLOG(ERROR) << "Failed to stat " << path;
+  }
+  if (auto filecon = GetfileconPath(path); filecon.ok()) {
+    LOG(ERROR) << path << ": filecon=" << filecon.value();
+  } else {
+    LOG(ERROR) << filecon.error();
+  }
+}
+
+// Returns the number of seconds since the epoch.
+inline android::base::Result<int64_t> GetLastModifiedTime(
+    const std::string& path) {
+  struct stat st_buf;
+  if (stat(path.c_str(), &st_buf) != 0) {
+    return android::base::ErrnoError() << "Failed to stat " << path;
+  }
+  return st_buf.st_mtime;
+}
+
+inline android::base::Result<void> SetLastModifiedTime(const std::string& path,
+                                                       int64_t mtime) {
+  struct timeval times[2];
+  times[0].tv_sec = mtime;
+  times[0].tv_usec = 0;
+  times[1].tv_sec = mtime;
+  times[1].tv_usec = 0;
+  if (utimes(path.c_str(), times) != 0) {
+    int saved_errno = errno;
+    if (saved_errno == EACCES) {
+      LogPermissionInfo(path);
+    }
+    return base::Error(saved_errno) << "Failed to set mtime for " << path;
+  }
+  return {};
+}
+
 inline void TouchFile(const std::string& dir, const std::string& filename) {
   namespace fs = std::filesystem;
   auto file = fs::path(dir) / filename;
   if (!android::base::WriteStringToFile("", file)) {
     PLOG(ERROR) << "Failed to create " << file;
   }
+}
+
+inline bool IsKernelAtLeast(unsigned int target_major,
+                            unsigned int target_minor) {
+  struct utsname uts;
+  unsigned int major, minor;
+
+  if ((uname(&uts) != 0) ||
+      (sscanf(uts.release, "%u.%u", &major, &minor) != 2)) {
+    LOG(ERROR) << "Could not get kernel version";
+    return false;
+  }
+  return major > target_major ||
+         (major == target_major && minor >= target_minor);
 }
 
 // Adapter for a single-valued span

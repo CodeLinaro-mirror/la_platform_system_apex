@@ -16,6 +16,8 @@
 
 #define LOG_TAG "apexd-dump"
 
+#include <libdm/dm.h>
+
 #include <format>
 #include <iostream>
 #include <print>
@@ -45,9 +47,11 @@ std::string JoinValues(const auto& values) {
 
 void DumpConfig(std::ostream& out) {
   const auto& config = GetConfig();
+  out << std::boolalpha;
   out << "config:";
-  out << " mount_before_data=" << std::boolalpha << config.mount_before_data;
-  out << " uses_pinned_apex=" << std::boolalpha << config.uses_pinned_apex;
+  out << " file_backed_mount=" << config.file_backed_mount;
+  out << " mount_before_data=" << config.mount_before_data;
+  out << " uses_pinned_apex=" << config.uses_pinned_apex;
   out << "\n";
 }
 
@@ -83,22 +87,67 @@ void DumpSessions(std::ostream& out) {
   }
 }
 
+void DumpMounts(std::ostream& out) {
+  auto& dm = dm::DeviceMapper::Instance();
+  auto dump_dm = [&](const std::string& type, const std::string& name) {
+    std::string path;
+    if (!dm.GetDmDevicePathByName(name, &path)) {
+      path = "(err)";
+    }
+    out << std::format(" {}={}({})", type, path, name);
+  };
+
+  MountedApexDatabase db;
+  db.PopulateFromMounts();
+  db.ForallMountedApexes([&](auto, const auto& data, auto) {
+    out << "mount:";
+    out << " mount_point=" << data.mount_point;
+    if (!data.verity_name.empty()) dump_dm("verity", data.verity_name);
+    if (!data.linear_name.empty()) dump_dm("linear", data.linear_name);
+    if (!data.loop_name.empty()) out << " loop=" << data.loop_name;
+    out << " apex=" << data.full_path;
+    out << " fs=";
+    auto apex_file = ApexFile::Open(data.full_path);
+    if (apex_file.ok() && apex_file->GetFsType().has_value()) {
+      out << apex_file->GetFsType().value();
+    } else {
+      out << "(err)";
+    }
+    out << "\n";
+  });
+}
+
 }  // namespace
 
-int OnDump(const std::vector<std::string>& args) {
-  bool dump_all = args.empty();
-  bool dump_config = std::ranges::contains(args, "config");
-  bool dump_sessions = std::ranges::contains(args, "sessions");
+struct DumpOption {
+  std::string name;
+  std::function<void(std::ostream&)> fn;
+};
 
-  if (dump_all || dump_config) {
-    DumpConfig(std::cout);
-  }
-  if (dump_all || dump_sessions) {
-    DumpSessions(std::cout);
+int OnDump(const std::vector<std::string>& args) {
+  auto options = std::vector<DumpOption>{
+      {"config", &DumpConfig},
+      {"sessions", &DumpSessions},
+      {"mounts", &DumpMounts},
+  };
+
+  if (args.empty()) {
+    // Dump all
+    for (const auto& option : options) {
+      option.fn(std::cout);
+    }
+  } else {
+    for (const auto& arg : args) {
+      for (const auto& option : options) {
+        if (arg == option.name) {
+          option.fn(std::cout);
+          break;
+        }
+      }
+    }
   }
 
   // TODO(b/432328407)
-  // active mounts
   // repository
   // images
   // metadata

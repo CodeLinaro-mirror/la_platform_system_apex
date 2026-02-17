@@ -30,7 +30,6 @@
 #include <libdm/dm.h>
 #include <linux/fs.h>
 #include <linux/loop.h>
-#include <string>
 #include <sys/ioctl.h>
 #include <sys/stat.h>
 #include <sys/statfs.h>
@@ -40,12 +39,17 @@
 #include <utils/Trace.h>
 
 #include <array>
+#include <atomic>
 #include <filesystem>
 #include <mutex>
+#include <string>
 #include <string_view>
 
+#include "apexd_private.h"
 #include "apexd_utils.h"
+#include "com_android_apex_flags.h"
 
+namespace flags = com::android::apex::flags;
 using android::base::Basename;
 using android::base::borrowed_fd;
 using android::base::Dirname;
@@ -53,11 +57,13 @@ using android::base::ErrnoError;
 using android::base::Error;
 using android::base::GetBoolProperty;
 using android::base::ParseUint;
+using android::base::ReadFdToString;
 using android::base::ReadFileToString;
 using android::base::Result;
 using android::base::StartsWith;
 using android::base::StringPrintf;
 using android::base::unique_fd;
+using android::base::WriteStringToFd;
 using android::dm::DeviceMapper;
 
 namespace android {
@@ -76,7 +82,20 @@ void LoopbackDeviceUniqueFd::MaybeCloseBad() {
   }
 }
 
+// The optimal I/O scheduler for loop devices is 'none'. 'none' is a better
+// choice than BFQ or mq-deadline because it does not delay I/O requests. 'none'
+// is a better choice than Kyber because it does not throttle I/O and because it
+// requires fewer CPU cycles.
 Result<void> ConfigureScheduler(const std::string& device_path) {
+  // If the system default is okay, then let's skip configuration for other loop
+  // devices.
+  static std::atomic<bool> skip_config{false};
+  if constexpr (flags::mount_before_data()) {
+    if (skip_config.load(std::memory_order_relaxed)) {
+      return {};
+    }
+  }
+
   ATRACE_NAME("ConfigureScheduler");
   if (!StartsWith(device_path, "/dev/")) {
     return Error() << "Invalid argument " << device_path;
@@ -91,33 +110,32 @@ Result<void> ConfigureScheduler(const std::string& device_path) {
     return ErrnoError() << "Failed to open " << sysfs_path;
   }
 
+  std::string cur_sched_str;
+  if (!ReadFdToString(sysfs_fd, &cur_sched_str)) {
+    return ErrnoError() << "Failed to read " << sysfs_path;
+  }
+
+  // Don't try to write sysfs if it's none/noop to avoid unnecessary locking
+  // overhead in kernel
+  if (cur_sched_str.find("[none]") != std::string::npos ||
+      cur_sched_str.find("[noop]") != std::string::npos) {
+    if constexpr (flags::mount_before_data()) {
+      // Remember this because other loop devices will be same
+      skip_config.store(true, std::memory_order_relaxed);
+    }
+    return {};
+  }
+
   // Kernels before v4.1 only support 'noop'. Kernels [v4.1, v5.0) support
   // 'noop' and 'none'. Kernels v5.0 and later only support 'none'.
   static constexpr const std::array<std::string_view, 2> kNoScheduler = {
       "none", "noop"};
-
-  int ret = 0;
-  std::string cur_sched_str;
-  if (!ReadFileToString(sysfs_path, &cur_sched_str)) {
-    return ErrnoError() << "Failed to read " << sysfs_path;
-  }
-  cur_sched_str = android::base::Trim(cur_sched_str);
-  if (std::count(kNoScheduler.begin(), kNoScheduler.end(), cur_sched_str)) {
-    return {};
-  }
-
   for (const std::string_view& scheduler : kNoScheduler) {
-    ret = write(sysfs_fd.get(), scheduler.data(), scheduler.size());
-    if (ret > 0) {
-      break;
+    if (WriteStringToFd(scheduler, sysfs_fd)) {
+      return {};
     }
   }
-
-  if (ret <= 0) {
-    return ErrnoError() << "Failed to write to " << sysfs_path;
-  }
-
-  return {};
+  return ErrnoError() << "Failed to write to " << sysfs_path;
 }
 
 // Return the parent device of a partition. Converts e.g. "sda26" into "sda".
@@ -245,19 +263,19 @@ Result<void> ConfigureQueueDepth(const std::string& loop_device_path,
 
   const std::string sysfs_path =
       StringPrintf("/sys/block/%s/queue/nr_requests", loop_device_name.c_str());
+  unique_fd sysfs_fd(open(sysfs_path.c_str(), O_RDWR | O_CLOEXEC));
+  if (sysfs_fd.get() == -1) {
+    return ErrnoErrorf("Failed to open {}", sysfs_path);
+  }
+
   std::string cur_nr_requests_str;
-  if (!ReadFileToString(sysfs_path, &cur_nr_requests_str)) {
+  if (!ReadFdToString(sysfs_fd, &cur_nr_requests_str)) {
     return ErrnoError() << "Failed to read " << sysfs_path;
   }
   cur_nr_requests_str = android::base::Trim(cur_nr_requests_str);
   uint32_t cur_nr_requests = 0;
   if (!ParseUint(cur_nr_requests_str.c_str(), &cur_nr_requests)) {
     return Error() << "Failed to parse " << cur_nr_requests_str;
-  }
-
-  unique_fd sysfs_fd(open(sysfs_path.c_str(), O_RDWR | O_CLOEXEC));
-  if (sysfs_fd.get() == -1) {
-    return ErrnoErrorf("Failed to open {}", sysfs_path);
   }
 
   const auto qd = BlockDeviceQueueDepth(file_path);
@@ -277,7 +295,7 @@ Result<void> ConfigureQueueDepth(const std::string& loop_device_path,
   return {};
 }
 
-Result<void> ConfigureReadAhead(const std::string& device_path) {
+Result<void> ConfigureReadAheadSysfs(const std::string& device_path) {
   ATRACE_NAME("ConfigureReadAhead");
   CHECK(StartsWith(device_path, "/dev/"));
   std::string device_name = Basename(device_path);
@@ -299,6 +317,35 @@ Result<void> ConfigureReadAhead(const std::string& device_path) {
   }
 
   return {};
+}
+
+Result<void> ConfigureReadAheadIoctl(base::borrowed_fd device_fd) {
+  static const unsigned long ra_in_sectors =
+      sysprop::ApexProperties::loopback_readahead().value_or(kReadAheadKb) * 2;
+
+  if (ioctl(device_fd.get(), BLKRASET, ra_in_sectors) == -1) {
+    return ErrnoError() << "Failed to set RA to " << ra_in_sectors
+                        << " (sectors)";
+  }
+  return {};
+}
+
+Result<void> ConfigureReadAhead(const std::string& device_path) {
+  if constexpr (flags::mount_before_data()) {
+    unique_fd fd(open(device_path.c_str(), O_RDONLY | O_CLOEXEC));
+    if (fd.get() == -1) {
+      return ErrnoError() << "Failed to open device for RA: " << device_path;
+    }
+    auto result = ConfigureReadAheadIoctl(fd);
+    if (!result.ok() && result.error().code() == EACCES) {
+      LOG(WARNING) << "ConfigureReadAheadIoctl failed with EACCES, falling "
+                      "back to sysfs";
+      return ConfigureReadAheadSysfs(device_path);
+    }
+    return result;
+  } else {
+    return ConfigureReadAheadSysfs(device_path);
+  }
 }
 
 Result<void> PreAllocateLoopDevices(size_t num) {
@@ -447,8 +494,29 @@ static Result<LoopbackDeviceUniqueFd> ConfigureLoopDevice(
   }
 }
 
+[[maybe_unused]] static std::optional<dev_t> ReadLoopDevNum(int num) {
+  std::string str;
+  if (ReadFileToString(std::format("/sys/block/loop{}/dev", num), &str)) {
+    unsigned int major, minor;
+    if (sscanf(str.c_str(), "%u:%u", &major, &minor) == 2) {
+      return makedev(major, minor);
+    }
+  }
+  return std::nullopt;
+}
+
 static Result<EmptyLoopDevice> WaitForLoopDevice(int num) {
-  std::string device = StringPrintf("/dev/block/loop%d", num);
+  std::string device = std::format("/dev/block/loop{}", num);
+  if constexpr (flags::mount_before_data()) {
+    // Let's make the node directly
+    if (access(device.c_str(), F_OK) != 0 && errno == ENOENT) {
+      if (auto dev = ReadLoopDevNum(num); dev) {
+        auto st = apexd_private::MakeBlockDeviceNode(
+            device, 0600, *dev, "u:object_r:loop_device:s0");
+        if (!st.ok()) LOG(ERROR) << st.error();
+      }
+    }
+  }
 
   // apexd-bootstrap runs in parallel with ueventd to optimize boot time. In
   // rare cases apexd would try attempt to mount an apex before ueventd created
@@ -596,9 +664,17 @@ Result<LoopbackDeviceUniqueFd> CreateAndConfigureLoopDevice(
     LOG(WARNING) << qd_status.error();
   }
 
-  Result<void> read_ahead_status = ConfigureReadAhead(loop_device->name);
-  if (!read_ahead_status.ok()) {
-    return read_ahead_status.error();
+  if constexpr (flags::mount_before_data()) {
+    auto result = ConfigureReadAheadIoctl(loop_device->device_fd);
+    if (!result.ok() && result.error().code() == EACCES) {
+      LOG(WARNING) << "ConfigureReadAheadIoctl failed with EACCES, falling "
+                      "back to sysfs";
+      OR_RETURN(ConfigureReadAheadSysfs(loop_device->name));
+    } else {
+      OR_RETURN(std::move(result));
+    }
+  } else {
+    OR_RETURN(ConfigureReadAheadSysfs(loop_device->name));
   }
 
   return loop_device;

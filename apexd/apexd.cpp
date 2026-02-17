@@ -30,6 +30,7 @@
 #include <android-base/strings.h>
 #include <android-base/thread_annotations.h>
 #include <android-base/unique_fd.h>
+#include <com_android_libdm.h>
 #include <dirent.h>
 #include <fcntl.h>
 #include <google/protobuf/util/message_differencer.h>
@@ -233,6 +234,14 @@ std::unique_ptr<DmTable> CreateVerityTable(const ApexVerityData& verity_data,
   if (restart_on_corruption) {
     target->SetVerityMode(kDmVerityRestartOnCorruption);
   }
+
+  // Will turn on the try_verify_in_tasklet optimization only if the
+  // kernel supports the improved version of the optimization.
+
+  if (com::android::libdm::dm_verity_verify_in_tasklet()) {
+    LOG(INFO) << "Adding TryVerifyInTasklet to dm-verity for apexd";
+    target->TryVerifyInTasklet();
+  }
   table->AddTarget(std::move(target));
 
   table->set_readonly(true);
@@ -383,6 +392,21 @@ bool IsFileBackedMountEnabled() { return gConfig->file_backed_mount; }
   return true;
 }
 
+#if COM_ANDROID_APEX_FLAGS_MICRODROID_NO_LOOP_DEVICE
+Result<DmDevice> CreateDmLinearForBlockApex(const ApexFile& apex,
+                                            const std::string& device_name) {
+  if (!apex.GetImageOffset() || !apex.GetImageSize()) {
+    return Error() << "Cannot create mount point without image offset and size";
+  }
+  Interval extent{*apex.GetImageOffset(), *apex.GetImageSize()};
+  auto dev = OR_RETURN(CreateDmLinear(device_name + kDmLinearPayloadSuffix,
+                                      apex.GetPath(), {extent},
+                                      /*read_only=*/false));
+  OR_RETURN(loop::ConfigureReadAhead(dev.GetDevPath()));
+  return std::move(dev);
+}
+#endif
+
 Result<DmDevice> CreateDmLinearForPayload(const ApexFile& apex) {
   if (!apex.GetImageOffset() || !apex.GetImageSize()) {
     return Error() << "Cannot create mount point without image offset and size";
@@ -496,6 +520,11 @@ Result<MountedApexData> MountPackageImpl(const ApexFile& apex,
              !mount_on_verity) {
     mount_options = std::format("fsoffset={}", *apex.GetImageOffset());
     mount_device = apex.GetPath();
+#if COM_ANDROID_APEX_FLAGS_MICRODROID_NO_LOOP_DEVICE
+  } else if (instance.IsBlockApex(apex)) {
+    linear_dev = OR_RETURN(CreateDmLinearForBlockApex(apex, device_name));
+    mount_device = linear_dev.GetDevPath();
+#endif
   } else {
     loop = OR_RETURN(CreateLoopForApex(apex, loop_id));
     mount_device = loop.name;
@@ -613,14 +642,36 @@ Result<void> RunTestHookCommands(const std::string& sysprop) {
       if (args[0] == "sleep_ms" && args.size() == 2 &&
           ParseUint(args[1], &num)) {
         usleep(num * 1000);
-      } else if (args[0] == "error" && args.size() == 2) {
-        return Error() << args[1];
+      } else if (args[0] == "error") {
+        return Error() << command.substr(6);
       } else {
         LOG(ERROR) << "Invalid command: " << command;
       }
     }
   }
   return {};
+}
+
+// Since apexd-bootstrap starts before persist.* props are loaded, apexd has its
+// own prop loader for test_hook properties.
+void LoadTestHookProps() {
+  constexpr const char* kTestHookPropFile = "/metadata/apex/test_hook.prop";
+  std::string props;
+  if (!base::ReadFileToString(kTestHookPropFile, &props)) {
+    return;
+  }
+  LOG(INFO) << "Loading " << kTestHookPropFile;
+  for (const std::string& line : base::Split(props, "\n")) {
+    auto trimmed = base::Trim(line);
+    if (trimmed.empty() || !trimmed.starts_with("apexd.test_hook.")) {
+      continue;
+    }
+    if (auto pos = trimmed.find('='); pos != std::string::npos) {
+      LOG(INFO) << "Set property: " << trimmed;
+      SetProperty(trimmed.substr(0, pos), trimmed.substr(pos + 1));
+    }
+  }
+  unlink(kTestHookPropFile);
 }
 
 }  // namespace
@@ -777,6 +828,11 @@ Result<void> VerifyVndkVersion(const ApexFile& apex_file) {
 // This function should only verification checks that are necessary to run on
 // each boot. Try to avoid putting expensive checks inside this function.
 Result<void> VerifyPackageBoot(const ApexFile& apex_file) {
+  // Run test commands only when validating Shim APEX on a debuggable device.
+  if (shim::IsShimApex(apex_file) && GetBoolProperty("ro.debuggable", false)) {
+    OR_RETURN(RunTestHookCommands("apexd.test_hook.verify_package_boot"));
+  }
+
   // Verify bundled key against preinstalled data
   OR_RETURN(apexd_private::CheckBundledPublicKeyMatchesPreinstalled(apex_file));
   // Verify bundled key against apex itself
@@ -2395,6 +2451,10 @@ int OnBootstrap() {
   ATRACE_NAME("OnBootstrap");
   auto time_started = boot_clock::now();
 
+  if (GetBoolProperty("ro.debuggable", false)) {
+    LoadTestHookProps();
+  }
+
   ApexFileRepository& instance = ApexFileRepository::GetInstance();
   if (auto st = AddPreinstalledData(instance); !st.ok()) {
     LOG(ERROR) << st.error();
@@ -2407,16 +2467,13 @@ int OnBootstrap() {
   bool revert_on_error = false;
 
   if (IsMountBeforeDataEnabled()) {
-    // Wait until coldboot is done. This is to avoid unnecessary polling when
-    // using/creating loop or device-mapper devices. Note that apexd relies on
-    // devices created by init process for faster activation. Their nodes are
-    // created by ueventd's coldboot. Hence, accessing them before coldboot is
-    // done causes polling, which can be much slower than waiting for coldboot.
-    // Similarly, before coldboot is done, ueventd can't handle a device
-    // creation. This will also cause polling the userspace node creation.
-    // Instead of racing with ueventd, let's wait until it finishes coldboot.
-    base::WaitForProperty("ro.cold_boot_done", "true",
-                          std::chrono::seconds(10));
+    // Data APEX is mapped as a dm-linear device on top of the block device
+    // backing /data (e.g. /dev/block/by-name/userdata). Hence, we need to make
+    // sure the block device is ready.
+    if (auto st = GetImageManager()->WaitForDataBlockDevice(); !st.ok()) {
+      LOG(ERROR) << st.error();
+      return 1;
+    }
 
     // Process sessions before scanning "active" data apexes because sessions
     // can change the list of active data apexes:

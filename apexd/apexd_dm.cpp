@@ -18,8 +18,14 @@
 
 #include <ApexProperties.sysprop.h>
 #include <android-base/logging.h>
+#include <android-base/scopeguard.h>
 #include <utils/Trace.h>
 
+#include "apexd_private.h"
+#include "apexd_utils.h"
+#include "com_android_apex_flags.h"
+
+namespace flags = com::android::apex::flags;
 using android::base::ErrnoError;
 using android::base::Error;
 using android::base::Result;
@@ -41,11 +47,30 @@ DmDevice::~DmDevice() {
 static Result<DmDevice> CreateDmDeviceInternal(
     DeviceMapper& dm, const std::string& name, const DmTable& table,
     const std::chrono::milliseconds& timeout) {
-  std::string dev_path;
-  if (!dm.CreateDevice(name, table, &dev_path, timeout)) {
+  if (!dm.CreateDevice(name, table)) {
     return Error() << "Couldn't create dm-device for name=" << name;
   }
-  return DmDevice(name, dev_path);
+  auto guard = base::make_scope_guard([&]() { dm.DeleteDevice(name); });
+  auto info = dm.GetDetailedInfo(name);
+  if (!info) {
+    return Error() << "Failed to create dm-device for name=" << name;
+  }
+  auto path = info->GetPath();
+
+  if constexpr (flags::mount_before_data()) {
+    // Let's make the device node directly before falling back to waiting
+    if (access(path.c_str(), F_OK) != 0 && errno == ENOENT) {
+      dev_t dev = info->GetDev();
+      mode_t mode = 0644;
+      const char* context = "u:object_r:apex_dm_device:s0";
+      auto st = apexd_private::MakeBlockDeviceNode(path, mode, dev, context);
+      if (!st.ok()) LOG(ERROR) << st.error();
+    }
+  }
+  OR_RETURN(WaitForFile(path, timeout));
+
+  guard.Disable();
+  return DmDevice(name, path);
 }
 
 Result<DmDevice> CreateDmDevice(const std::string& name, const DmTable& table,
@@ -92,6 +117,18 @@ Result<DmDevice> CreateDmDevice(const std::string& name, const DmTable& table,
 // Synchronizes on the device actually being deleted from userspace.
 Result<void> DeleteDmDevice(const std::string& name, bool deferred) {
   DeviceMapper& dm = DeviceMapper::Instance();
+
+  // Since apexd does mknod() directly, ueventd might not have a chance to
+  // handle "add" event yet. Let's wait for "unique" path to be created by
+  // ueventd with "add" event before deletion to avoid race. Otherwise,
+  // ueventd or libdm may fail to handle deletion properly.
+  std::string unique_path;
+  if (DeviceMapper::Instance().GetDeviceUniquePath(name, &unique_path)) {
+    if (auto st = WaitForFile(unique_path, 5s); !st.ok()) {
+      LOG(ERROR) << "Failed to wait for " << unique_path << ": " << st.error();
+    }
+  }
+
   if (deferred) {
     if (!dm.DeleteDeviceDeferred(name)) {
       return ErrnoError() << "Failed to issue deferred delete of dm-device "
